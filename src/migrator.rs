@@ -18,7 +18,7 @@ pub struct MigrationReport<'migration> {
     pub failing_migration: Option<MigrationFailure<'migration>>,
 }
 
-const SCHEMA_VERSION_TABLE_NAME: &str = "_migratio_version_";
+const DEFAULT_VERSION_TABLE_NAME: &str = "_migratio_version_";
 
 /// A trait that must be implemented to define a migration.
 /// The `version` value must be unique among all migrations supplied to the migrator, and greater than 0.
@@ -58,16 +58,65 @@ impl std::fmt::Debug for dyn Migration {
 /// The entrypoint for running a sequence of [Migration]s.
 /// Construct this struct with the list of all [Migration]s to be applied.
 /// [Migration::version]s must be contiguous, greater than zero, and unique.
+#[derive(Debug)]
 pub struct SqliteMigrator {
     migrations: Vec<Box<dyn Migration>>,
     schema_version_table_name: String,
 }
 
 impl SqliteMigrator {
-    pub fn new(migrations: Vec<Box<dyn Migration>>) -> Self {
-        Self {
+    /// Create a new SqliteMigrator, validating migration invariants.
+    /// Returns an error if migrations are invalid.
+    pub fn try_new(migrations: Vec<Box<dyn Migration>>) -> Result<Self, String> {
+        // Verify invariants
+        let mut versions: Vec<u32> = migrations.iter().map(|m| m.version()).collect();
+        versions.sort();
+
+        // Check for duplicates and zero versions
+        for (i, &version) in versions.iter().enumerate() {
+            // Version must be greater than zero
+            if version == 0 {
+                return Err("Migration version must be greater than 0, found version 0".to_string());
+            }
+
+            // Check for duplicates
+            if i > 0 && versions[i - 1] == version {
+                return Err(format!("Duplicate migration version found: {}", version));
+            }
+        }
+
+        // Check for contiguity (versions must be 1, 2, 3, ...)
+        if !versions.is_empty() {
+            if versions[0] != 1 {
+                return Err(format!(
+                    "Migration versions must start at 1, found starting version: {}",
+                    versions[0]
+                ));
+            }
+
+            for (i, &version) in versions.iter().enumerate() {
+                let expected = (i + 1) as u32;
+                if version != expected {
+                    return Err(format!(
+                        "Migration versions must be contiguous. Expected version {}, found {}",
+                        expected, version
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
             migrations,
-            schema_version_table_name: SCHEMA_VERSION_TABLE_NAME.to_string(),
+            schema_version_table_name: DEFAULT_VERSION_TABLE_NAME.to_string(),
+        })
+    }
+
+    /// Create a new SqliteMigrator, panicking if migration metadata is invalid.
+    /// For a non-panicking version, use `try_new`.
+    pub fn new(migrations: Vec<Box<dyn Migration>>) -> Self {
+        match Self::try_new(migrations) {
+            Ok(migrator) => migrator,
+            Err(err) => panic!("{}", err),
         }
     }
 
@@ -702,5 +751,200 @@ mod tests {
         assert_eq!(all_migrations[0].2, all_migrations[1].2);
         // Third should have different timestamp (from second batch)
         assert_ne!(all_migrations[2].2, first_batch_timestamp);
+    }
+
+    #[test]
+    #[should_panic(expected = "Migration version must be greater than 0")]
+    fn new_rejects_zero_version() {
+        struct Migration0;
+        impl Migration for Migration0 {
+            fn version(&self) -> u32 {
+                0
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let _ = SqliteMigrator::new(vec![Box::new(Migration0)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Duplicate migration version found: 2")]
+    fn new_rejects_duplicate_versions() {
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration2a;
+        impl Migration for Migration2a {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration2b;
+        impl Migration for Migration2b {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let _ = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2a),
+            Box::new(Migration2b),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Migration versions must start at 1, found starting version: 2")]
+    fn new_rejects_non_starting_at_one() {
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let _ = SqliteMigrator::new(vec![Box::new(Migration2), Box::new(Migration3)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Migration versions must be contiguous. Expected version 2, found 3")]
+    fn new_rejects_non_contiguous() {
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let _ = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration3)]);
+    }
+
+    #[test]
+    fn try_new_returns_err_for_non_starting_at_one() {
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let result = SqliteMigrator::try_new(vec![Box::new(Migration2)]);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Migration versions must start at 1, found starting version: 2"
+        );
+    }
+
+    #[test]
+    fn try_new_returns_err_for_duplicate_versions() {
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration2a;
+        impl Migration for Migration2a {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration2b;
+        impl Migration for Migration2b {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let result = SqliteMigrator::try_new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2a),
+            Box::new(Migration2b),
+        ]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Duplicate migration version found: 2");
+    }
+
+    #[test]
+    fn try_new_returns_ok_for_valid_migrations() {
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let result = SqliteMigrator::try_new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        assert!(result.is_ok());
     }
 }
