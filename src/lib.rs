@@ -317,4 +317,6 @@ mod error;
 mod migrator;
 
 pub use error::Error;
-pub use migrator::{Migration, MigrationFailure, MigrationReport, SqliteMigrator};
+pub use migrator::{
+    AppliedMigration, Migration, MigrationFailure, MigrationReport, SqliteMigrator,
+};

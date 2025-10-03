@@ -31,6 +31,19 @@ pub struct MigrationReport<'migration> {
     pub failing_migration: Option<MigrationFailure<'migration>>,
 }
 
+/// Represents a migration that has been applied to the database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedMigration {
+    /// The version number of the migration.
+    pub version: u32,
+    /// The name of the migration.
+    pub name: String,
+    /// The timestamp when the migration was applied.
+    pub applied_at: chrono::DateTime<Utc>,
+    /// The checksum of the migration at the time it was applied.
+    pub checksum: String,
+}
+
 const DEFAULT_VERSION_TABLE_NAME: &str = "_migratio_version_";
 
 /// A trait that must be implemented to define a migration.
@@ -183,6 +196,56 @@ impl SqliteMigrator {
         ))?;
         let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
         Ok(version.unwrap_or(0))
+    }
+
+    /// Get the history of all migrations that have been applied to the database.
+    /// Returns migrations in the order they were applied (by version number).
+    /// Returns an empty vector if no migrations have been applied.
+    pub fn get_migration_history(
+        &self,
+        conn: &mut Connection,
+    ) -> Result<Vec<AppliedMigration>, Error> {
+        // Check if schema version table exists
+        let mut stmt =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
+        let table_exists = stmt
+            .query([&self.schema_version_table_name])?
+            .next()?
+            .is_some();
+
+        if !table_exists {
+            return Ok(vec![]);
+        }
+
+        // Query all applied migrations, ordered by version
+        let mut stmt = conn.prepare(&format!(
+            "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
+            self.schema_version_table_name
+        ))?;
+
+        let migrations = stmt
+            .query_map([], |row| {
+                let applied_at_str: String = row.get(2)?;
+                let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+                    .with_timezone(&Utc);
+
+                Ok(AppliedMigration {
+                    version: row.get(0)?,
+                    name: row.get(1)?,
+                    applied_at,
+                    checksum: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(migrations)
     }
 
     /// Preview which migrations would be applied by `upgrade()` without actually running them.
@@ -2124,5 +2187,169 @@ mod tests {
             }
             None => panic!("Expected a failure"),
         }
+    }
+
+    #[test]
+    fn get_migration_history_on_clean_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history.len(), 0);
+    }
+
+    #[test]
+    fn get_migration_history_after_migrations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test1_table".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test2_table".to_string()
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+
+        assert_eq!(history.len(), 2);
+
+        // Check first migration
+        assert_eq!(history[0].version, 1);
+        assert_eq!(history[0].name, "create_test1_table");
+        assert!(history[0].applied_at.timestamp() > 0);
+        assert_eq!(history[0].checksum.len(), 64); // SHA-256 hex string
+
+        // Check second migration
+        assert_eq!(history[1].version, 2);
+        assert_eq!(history[1].name, "create_test2_table");
+        assert!(history[1].applied_at.timestamp() > 0);
+        assert_eq!(history[1].checksum.len(), 64);
+
+        // Both should have same applied_at timestamp (same batch)
+        assert_eq!(history[0].applied_at, history[1].applied_at);
+    }
+
+    #[test]
+    fn get_migration_history_shows_incremental_batches() {
+        use std::thread;
+        use std::time::Duration;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "migration_one".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "migration_two".to_string()
+            }
+        }
+
+        // Run first migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history.len(), 1);
+        let first_timestamp = history[0].applied_at;
+
+        // Wait a bit to ensure different timestamp
+        thread::sleep(Duration::from_millis(2));
+
+        // Run second migration in a new batch
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history.len(), 2);
+
+        // First migration timestamp should be unchanged
+        assert_eq!(history[0].applied_at, first_timestamp);
+
+        // Second migration should have different timestamp
+        assert_ne!(history[1].applied_at, first_timestamp);
+    }
+
+    #[test]
+    fn get_migration_history_includes_checksums() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "test_migration".to_string()
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history.len(), 1);
+
+        // Verify checksum matches what would be calculated
+        let migration = Box::new(Migration1) as Box<dyn Migration>;
+        let expected_checksum = SqliteMigrator::calculate_checksum(&migration);
+        assert_eq!(history[0].checksum, expected_checksum);
     }
 }
