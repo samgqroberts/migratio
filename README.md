@@ -541,6 +541,3 @@ fn test_data_transformation_migration() {
 - **Queries**: `execute()`, `query_one()`, `query_all()`, `query_map()`
 - **Schema Assertions**: `assert_table_exists()`, `assert_column_exists()`, `assert_index_exists()`
 - **Schema Snapshots**: `capture_schema()`, `assert_schema_matches()`
-
-
-License: MIT
