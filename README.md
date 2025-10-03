@@ -401,5 +401,89 @@ tracing_subscriber::fmt::init();
 // INFO migration_up{version=1 name="create_users"}: Migration completed successfully duration_ms=15
 ```
 
+## Migration Testing Utilities
+
+Enable the `testing` feature to access utilities for comprehensive migration testing:
+
+```toml
+[dev-dependencies]
+migratio = { version = "0.1", features = ["testing"] }
+```
+
+The `MigrationTestHarness` provides controlled migration state management, query helpers,
+and schema assertions:
+
+```rust
+use migratio::testing::MigrationTestHarness;
+use migratio::{Migration, Error};
+use rusqlite::Transaction;
+
+struct Migration1;
+impl Migration for Migration1 {
+    fn version(&self) -> u32 { 1 }
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
+        Ok(())
+    }
+    fn down(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("DROP TABLE users", [])?;
+        Ok(())
+    }
+}
+
+#[test]
+fn test_migration_1() {
+    let mut harness = MigrationTestHarness::new(vec![Box::new(Migration1)]);
+
+    // Migrate to version 1
+    harness.migrate_to(1).unwrap();
+
+    // Insert test data
+    harness.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+
+    // Assert table exists
+    harness.assert_table_exists("users").unwrap();
+
+    // Query data
+    let name: String = harness.query_one("SELECT name FROM users WHERE id = 1").unwrap();
+    assert_eq!(name, "alice");
+
+    // Test reversibility
+    let schema_at_1 = harness.capture_schema().unwrap();
+    harness.migrate_to(0).unwrap();
+    harness.migrate_to(1).unwrap();
+    harness.assert_schema_matches(&schema_at_1).unwrap();
+}
+```
+
+### Testing Data Transformations
+
+The harness is particularly useful for testing complex data transformations:
+
+```rust
+#[test]
+fn test_data_transformation_migration() {
+    let mut harness = MigrationTestHarness::new(all_migrations());
+
+    // Set up test data in old format
+    harness.migrate_to(1).unwrap();
+    harness.execute("INSERT INTO prefs VALUES ('alice', 'theme:dark|help:off')").unwrap();
+
+    // Run migration that transforms data
+    harness.migrate_up_one().unwrap();
+
+    // Assert transformation succeeded
+    let prefs: String = harness.query_one("SELECT data FROM prefs WHERE name = 'alice'").unwrap();
+    assert_eq!(prefs, r#"{"theme":"dark","help":"off"}"#);
+}
+```
+
+### Available Test Methods
+
+- **Navigation**: `migrate_to()`, `migrate_up_one()`, `migrate_down_one()`, `current_version()`
+- **Queries**: `execute()`, `query_one()`, `query_all()`, `query_map()`
+- **Schema Assertions**: `assert_table_exists()`, `assert_column_exists()`, `assert_index_exists()`
+- **Schema Snapshots**: `capture_schema()`, `assert_schema_matches()`
+
 
 License: MIT
