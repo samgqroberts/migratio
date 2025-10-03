@@ -190,4 +190,4 @@ mod error;
 mod migrator;
 
 pub use error::Error;
-pub use migrator::{Migration, MigrationReport, SqliteMigrator, SCHEMA_VERSION_TABLE_NAME};
+pub use migrator::{Migration, MigrationReport, SqliteMigrator};

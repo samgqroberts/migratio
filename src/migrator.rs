@@ -18,7 +18,7 @@ pub struct MigrationReport<'migration> {
     pub failing_migration: Option<MigrationFailure<'migration>>,
 }
 
-pub const SCHEMA_VERSION_TABLE_NAME: &str = "_schema_version_";
+const SCHEMA_VERSION_TABLE_NAME: &str = "_migratio_version_";
 
 /// A trait that must be implemented to define a migration.
 /// The `version` value must be unique among all migrations supplied to the migrator, and greater than 0.
@@ -60,11 +60,22 @@ impl std::fmt::Debug for dyn Migration {
 /// [Migration::version]s must be contiguous, greater than zero, and unique.
 pub struct SqliteMigrator {
     migrations: Vec<Box<dyn Migration>>,
+    schema_version_table_name: String,
 }
 
 impl SqliteMigrator {
     pub fn new(migrations: Vec<Box<dyn Migration>>) -> Self {
-        Self { migrations }
+        Self {
+            migrations,
+            schema_version_table_name: SCHEMA_VERSION_TABLE_NAME.to_string(),
+        }
+    }
+
+    /// Set a custom name for the schema version tracking table.
+    /// Defaults to "_migratio_version_".
+    pub fn with_schema_version_table_name(mut self, name: String) -> Self {
+        self.schema_version_table_name = name;
+        self
     }
 
     /// Apply all previously-unapplied [Migration]s to the database with the given [Connection].
@@ -74,14 +85,16 @@ impl SqliteMigrator {
         let schema_version_table_existed = {
             let mut stmt =
                 conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
-            let schema_version_table_existed =
-                stmt.query([SCHEMA_VERSION_TABLE_NAME])?.next()?.is_some();
+            let schema_version_table_existed = stmt
+                .query([&self.schema_version_table_name])?
+                .next()?
+                .is_some();
             if !schema_version_table_existed {
                 // create table
                 conn.execute(
                 &format!(
                     "CREATE TABLE {} (version integer primary key not null, applied_at text not null)",
-                    SCHEMA_VERSION_TABLE_NAME
+                    self.schema_version_table_name
                 ),
                 [],)?;
                 // insert a row
@@ -90,7 +103,7 @@ impl SqliteMigrator {
                 conn.execute(
                     &format!(
                         "INSERT INTO {} (version, applied_at) VALUES(?1, ?2)",
-                        SCHEMA_VERSION_TABLE_NAME
+                        self.schema_version_table_name
                     ),
                     params![version, applied_at],
                 )?;
@@ -101,7 +114,7 @@ impl SqliteMigrator {
         let current: Option<(u32, DateTime<Utc>)> = {
             let mut stmt = conn.prepare(&format!(
                 "SELECT version, applied_at from {}",
-                SCHEMA_VERSION_TABLE_NAME
+                self.schema_version_table_name
             ))?;
             let mut rows = stmt.query([]).unwrap();
             let current: Option<(u32, DateTime<Utc>)> = if let Some(row) = rows.next().unwrap() {
@@ -142,7 +155,7 @@ impl SqliteMigrator {
                         conn.execute(
                             &format!(
                                 "UPDATE {} SET version = ?1, applied_at = ?2 WHERE true",
-                                SCHEMA_VERSION_TABLE_NAME
+                                self.schema_version_table_name
                             ),
                             params![migration_version, applied_at],
                         )?;
@@ -205,7 +218,7 @@ mod tests {
             }
         );
         // expect schema version table to exist and have recorded version 1
-        let mut stmt = conn.prepare("SELECT * FROM _schema_version_").unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM _migratio_version_").unwrap();
         let rows = stmt
             .query_map([], |row| {
                 let version: u32 = row.get("version").unwrap();
@@ -292,7 +305,7 @@ mod tests {
         tables.sort();
         assert_eq!(
             tables,
-            vec!["_schema_version_".to_string(), "test".to_string()]
+            vec!["_migratio_version_".to_string(), "test".to_string()]
         );
         // expect data to be unchanged
         let mut stmt = conn.prepare("SELECT * FROM test").unwrap();
@@ -388,7 +401,7 @@ mod tests {
         tables.sort();
         assert_eq!(
             tables,
-            vec!["_schema_version_".to_string(), "test2".to_string()]
+            vec!["_migratio_version_".to_string(), "test2".to_string()]
         );
         // expect data to be as expected
         let mut stmt = conn.prepare("SELECT * FROM test2").unwrap();
@@ -484,7 +497,7 @@ mod tests {
         tables.sort();
         assert_eq!(
             tables,
-            vec!["_schema_version_".to_string(), "test2".to_string()]
+            vec!["_migratio_version_".to_string(), "test2".to_string()]
         );
         // expect data to still be in test2 (from Migration1)
         let mut stmt = conn.prepare("SELECT * FROM test2").unwrap();
@@ -570,7 +583,7 @@ mod tests {
         // Assert current behavior: Migration1 succeeded, Migration2 rolled back
         assert_eq!(
             tables,
-            vec!["_schema_version_".to_string(), "test2".to_string()]
+            vec!["_migratio_version_".to_string(), "test2".to_string()]
         );
 
         // Verify data from Migration1 is intact
@@ -587,7 +600,7 @@ mod tests {
 
         // Verify schema_version table has version 1 (Migration1 completed, Migration2 never completed)
         let mut stmt = conn
-            .prepare("SELECT version FROM _schema_version_")
+            .prepare("SELECT version FROM _migratio_version_")
             .unwrap();
         let version: u32 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(version, 1);
