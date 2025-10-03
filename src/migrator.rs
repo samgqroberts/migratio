@@ -156,8 +156,8 @@ impl SqliteMigrator {
 
     /// Set a custom name for the schema version tracking table.
     /// Defaults to "_migratio_version_".
-    pub fn with_schema_version_table_name(mut self, name: String) -> Self {
-        self.schema_version_table_name = name;
+    pub fn with_schema_version_table_name(mut self, name: impl Into<String>) -> Self {
+        self.schema_version_table_name = name.into();
         self
     }
 
