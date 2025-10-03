@@ -1,5 +1,5 @@
 use crate::error::Error;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, Transaction};
 
 /// Represents a failure during a migration.
@@ -90,44 +90,24 @@ impl SqliteMigrator {
                 .next()?
                 .is_some();
             if !schema_version_table_existed {
-                // create table
+                // create table with name column
                 conn.execute(
                 &format!(
-                    "CREATE TABLE {} (version integer primary key not null, applied_at text not null)",
+                    "CREATE TABLE {} (version integer primary key not null, name text not null, applied_at text not null)",
                     self.schema_version_table_name
                 ),
                 [],)?;
-                // insert a row
-                let version: u32 = 0;
-                let applied_at = Utc::now().to_rfc3339();
-                conn.execute(
-                    &format!(
-                        "INSERT INTO {} (version, applied_at) VALUES(?1, ?2)",
-                        self.schema_version_table_name
-                    ),
-                    params![version, applied_at],
-                )?;
             }
             schema_version_table_existed
         };
-        // get current migration version
-        let current: Option<(u32, DateTime<Utc>)> = {
+        // get current migration version (highest version number)
+        let current_version: u32 = {
             let mut stmt = conn.prepare(&format!(
-                "SELECT version, applied_at from {}",
+                "SELECT MAX(version) from {}",
                 self.schema_version_table_name
             ))?;
-            let mut rows = stmt.query([]).unwrap();
-            let current: Option<(u32, DateTime<Utc>)> = if let Some(row) = rows.next().unwrap() {
-                let version: u32 = row.get(0)?;
-                let applied_at: String = row.get(1)?;
-                let applied_at = DateTime::parse_from_rfc3339(&applied_at)
-                    .map_err(|e| Error::Generic(e.to_string()))?
-                    .to_utc();
-                Some((version, applied_at))
-            } else {
-                None
-            };
-            current
+            let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
+            version.unwrap_or(0)
         };
         // iterate through migrations, run those that haven't been run
         let mut migrations_run: Vec<u32> = Vec::new();
@@ -139,8 +119,10 @@ impl SqliteMigrator {
         migrations_sorted.sort_by_key(|m| m.0);
         let mut failing_migration: Option<MigrationFailure> = None;
         let mut schema_version_table_created = false;
+        // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
+        let batch_applied_at = Utc::now().to_rfc3339();
         for (migration_version, migration) in migrations_sorted {
-            if current.map(|x| x.0).unwrap_or(0) < migration_version {
+            if current_version < migration_version {
                 // Start a transaction for this migration
                 let tx = conn.transaction()?;
                 let migration_result = migration.up(&tx);
@@ -150,14 +132,13 @@ impl SqliteMigrator {
                         // Commit the transaction
                         tx.commit()?;
 
-                        // Update the schema version immediately after successful migration
-                        let applied_at = Utc::now().to_rfc3339();
+                        // Insert a row for this migration with its name and the batch timestamp
                         conn.execute(
                             &format!(
-                                "UPDATE {} SET version = ?1, applied_at = ?2 WHERE true",
+                                "INSERT INTO {} (version, name, applied_at) VALUES(?1, ?2, ?3)",
                                 self.schema_version_table_name
                             ),
-                            params![migration_version, applied_at],
+                            params![migration_version, migration.name(), &batch_applied_at],
                         )?;
 
                         // record migration as run
@@ -189,12 +170,12 @@ impl SqliteMigrator {
 
 #[cfg(test)]
 mod tests {
-    use chrono::FixedOffset;
-
     use super::*;
 
     #[test]
     fn single_successful_from_clean() {
+        use chrono::{DateTime, FixedOffset};
+
         let mut conn = Connection::open_in_memory().unwrap();
         struct Migration1;
         impl Migration for Migration1 {
@@ -222,15 +203,17 @@ mod tests {
         let rows = stmt
             .query_map([], |row| {
                 let version: u32 = row.get("version").unwrap();
+                let name: String = row.get("name").unwrap();
                 let applied_at: String = row.get("applied_at").unwrap();
-                Ok((version, applied_at))
+                Ok((version, name, applied_at))
             })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 1); // version
-        let date_string_raw = &rows[0].1;
+        assert_eq!(rows[0].1, "Migration 1"); // name (default)
+        let date_string_raw = &rows[0].2;
         let date = DateTime::parse_from_rfc3339(&date_string_raw).unwrap();
         assert_eq!(date.timezone(), FixedOffset::east_opt(0).unwrap());
         // ensure that the date is within 5 seconds of now
@@ -604,5 +587,120 @@ mod tests {
             .unwrap();
         let version: u32 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn incremental_migrations_different_applied_at() {
+        use std::thread;
+        use std::time::Duration;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Define first set of migrations
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test1_table".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test2_table".to_string()
+            }
+        }
+
+        // Run first batch of migrations
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1, 2]);
+
+        // Get the applied_at timestamp for first batch
+        let first_batch: Vec<(u32, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT version, name, applied_at FROM _migratio_version_ ORDER BY version",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        assert_eq!(first_batch.len(), 2);
+        assert_eq!(first_batch[0].0, 1);
+        assert_eq!(first_batch[0].1, "create_test1_table");
+        assert_eq!(first_batch[1].0, 2);
+        assert_eq!(first_batch[1].1, "create_test2_table");
+        // Both migrations in first batch should have same timestamp
+        assert_eq!(first_batch[0].2, first_batch[1].2);
+        let first_batch_timestamp = first_batch[0].2.clone();
+
+        // Wait a bit to ensure different timestamp
+        thread::sleep(Duration::from_millis(2));
+
+        // Define third migration
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test3_table".to_string()
+            }
+        }
+
+        // Run second batch with all three migrations (only migration 3 should run)
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+            Box::new(Migration3),
+        ]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![3]);
+
+        // Verify all three migrations are recorded
+        let all_migrations: Vec<(u32, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT version, name, applied_at FROM _migratio_version_ ORDER BY version",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        assert_eq!(all_migrations.len(), 3);
+        assert_eq!(all_migrations[0].0, 1);
+        assert_eq!(all_migrations[1].0, 2);
+        assert_eq!(all_migrations[2].0, 3);
+        assert_eq!(all_migrations[2].1, "create_test3_table");
+
+        // First two should have same timestamp (from first batch)
+        assert_eq!(all_migrations[0].2, all_migrations[1].2);
+        // Third should have different timestamp (from second batch)
+        assert_ne!(all_migrations[2].2, first_batch_timestamp);
     }
 }
