@@ -57,6 +57,45 @@
 //! assert_eq!(columns, vec!["id", "name", "email"]);
 //! ```
 //!
+//! # Rollback Support
+//!
+//! Migrations can optionally implement the `down()` method to enable rollback via `downgrade()`:
+//!
+//! ```
+//! use migratio::{Migration, SqliteMigrator, Error};
+//! use rusqlite::{Connection, Transaction};
+//!
+//! struct Migration1;
+//!
+//! impl Migration for Migration1 {
+//!     fn version(&self) -> u32 {
+//!         1
+//!     }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
+//!         Ok(())
+//!     }
+//!     fn down(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("DROP TABLE users", [])?;
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let mut conn = Connection::open_in_memory().unwrap();
+//! let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+//!
+//! // Apply migration
+//! migrator.upgrade(&mut conn).unwrap();
+//!
+//! // Rollback to version 0 (removes all migrations)
+//! migrator.downgrade(&mut conn, 0).unwrap();
+//!
+//! // Or rollback to a specific version
+//! // migrator.downgrade(&mut conn, 1).unwrap(); // Rollback to version 1
+//! ```
+//!
+//! If a migration doesn't implement `down()`, calling `downgrade()` will panic with a helpful error message.
+//!
 //! # Motivation
 //!
 //! Most Rust-based migration solutions focus only on using SQL to define migration logic.

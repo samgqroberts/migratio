@@ -25,11 +25,22 @@ const DEFAULT_VERSION_TABLE_NAME: &str = "_migratio_version_";
 /// The `version` value must be unique among all migrations supplied to the migrator, and greater than 0.
 /// Implement your migration logic in the `up` method, using the supplied [Transaction] to perform database operations.
 /// The transaction will be automatically committed if the migration succeeds, or rolled back if it fails.
+/// Optionally implement the `down` method to enable rollback support via [SqliteMigrator::downgrade].
 /// The `name` and `description` methods are optional, and only aid in debugging / observability.
 pub trait Migration {
     fn version(&self) -> u32;
 
     fn up(&self, tx: &Transaction) -> Result<(), Error>;
+
+    /// Rollback this migration. This is optional - the default implementation panics.
+    /// If you want to support downgrade functionality, implement this method.
+    fn down(&self, _tx: &Transaction) -> Result<(), Error> {
+        panic!(
+            "Migration {} ('{}') does not support downgrade. Implement the down() method to enable rollback.",
+            self.version(),
+            self.name()
+        )
+    }
 
     fn name(&self) -> String {
         format!("Migration {}", self.version())
@@ -277,6 +288,155 @@ impl SqliteMigrator {
         Ok(MigrationReport {
             schema_version_table_existed,
             schema_version_table_created,
+            failing_migration,
+            migrations_run,
+        })
+    }
+
+    /// Rollback migrations down to the specified target version.
+    /// Pass `target_version = 0` to rollback all migrations.
+    /// Each migration's `down()` method runs within its own transaction, which is automatically rolled back if it fails.
+    /// Returns a [MigrationReport] describing which migrations were rolled back.
+    pub fn downgrade(
+        &self,
+        conn: &mut Connection,
+        target_version: u32,
+    ) -> Result<MigrationReport<'_>, Error> {
+        // Check if schema version table exists
+        let schema_version_table_existed = {
+            let mut stmt =
+                conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
+            let exists = stmt
+                .query([&self.schema_version_table_name])?
+                .next()?
+                .is_some();
+            exists
+        };
+
+        if !schema_version_table_existed {
+            // No migrations have been applied yet
+            return Ok(MigrationReport {
+                schema_version_table_existed: false,
+                schema_version_table_created: false,
+                failing_migration: None,
+                migrations_run: vec![],
+            });
+        }
+
+        // Validate checksums of previously-applied migrations (same as upgrade)
+        let has_checksum_column = {
+            let mut stmt = conn.prepare(&format!(
+                "PRAGMA table_info({})",
+                self.schema_version_table_name
+            ))?;
+            let columns: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.contains(&"checksum".to_string())
+        };
+
+        if has_checksum_column {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT version, name, checksum FROM {}",
+                self.schema_version_table_name
+            ))?;
+            let applied_migrations: Vec<(u32, String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for (applied_version, applied_name, applied_checksum) in applied_migrations {
+                if let Some(migration) = self
+                    .migrations
+                    .iter()
+                    .find(|m| m.version() == applied_version)
+                {
+                    let current_checksum = Self::calculate_checksum(migration);
+                    if current_checksum != applied_checksum {
+                        return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                            format!(
+                                "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
+                                Migration name in DB: '{}', current name: '{}'. \
+                                This indicates the migration was modified after being applied.",
+                                applied_version,
+                                applied_checksum,
+                                current_checksum,
+                                applied_name,
+                                migration.name()
+                            ),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Get current version
+        let current_version: u32 = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT MAX(version) from {}",
+                self.schema_version_table_name
+            ))?;
+            let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
+            version.unwrap_or(0)
+        };
+
+        // Validate target version
+        if target_version > current_version {
+            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                format!(
+                    "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
+                    target_version, current_version
+                ),
+            )));
+        }
+
+        // Get migrations to rollback (in reverse order)
+        let mut migrations_to_rollback = self
+            .migrations
+            .iter()
+            .filter(|m| m.version() > target_version && m.version() <= current_version)
+            .map(|x| (x.version(), x))
+            .collect::<Vec<_>>();
+        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.0)); // Reverse order
+
+        let mut migrations_run: Vec<u32> = Vec::new();
+        let mut failing_migration: Option<MigrationFailure> = None;
+
+        for (migration_version, migration) in migrations_to_rollback {
+            // Start a transaction for this migration rollback
+            let tx = conn.transaction()?;
+            let migration_result = migration.down(&tx);
+
+            match migration_result {
+                Ok(_) => {
+                    // Commit the transaction
+                    tx.commit()?;
+
+                    // Delete this migration from the tracking table
+                    conn.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE version = ?1",
+                            self.schema_version_table_name
+                        ),
+                        params![migration_version],
+                    )?;
+
+                    // record migration as rolled back
+                    migrations_run.push(migration_version);
+                }
+                Err(e) => {
+                    // Transaction will be automatically rolled back when dropped
+                    failing_migration = Some(MigrationFailure {
+                        migration,
+                        error: e,
+                    });
+                    break;
+                }
+            }
+        }
+
+        Ok(MigrationReport {
+            schema_version_table_existed,
+            schema_version_table_created: false,
             failing_migration,
             migrations_run,
         })
@@ -1147,5 +1307,336 @@ mod tests {
         let migration = Box::new(Migration1) as Box<dyn Migration>;
         let expected_checksum = SqliteMigrator::calculate_checksum(&migration);
         assert_eq!(checksum, expected_checksum);
+    }
+
+    #[test]
+    fn downgrade_single_migration() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test", [])?;
+                Ok(())
+            }
+        }
+
+        // Apply migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1]);
+
+        // Verify table exists
+        {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='test'")
+                .unwrap();
+            assert!(stmt.query([]).unwrap().next().unwrap().is_some());
+        }
+
+        // Rollback migration
+        let report = migrator.downgrade(&mut conn, 0).unwrap();
+        assert_eq!(report.migrations_run, vec![1]);
+
+        // Verify table is gone
+        {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='test'")
+                .unwrap();
+            assert!(stmt.query([]).unwrap().next().unwrap().is_none());
+        }
+
+        // Verify tracking table shows no migrations
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*) FROM _migratio_version_")
+            .unwrap();
+        let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn downgrade_multiple_migrations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test1", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test2", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test3", [])?;
+                Ok(())
+            }
+        }
+
+        // Apply all migrations
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+            Box::new(Migration3),
+        ]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1, 2, 3]);
+
+        // Rollback to version 1 (should rollback migrations 3 and 2, in that order)
+        let report = migrator.downgrade(&mut conn, 1).unwrap();
+        assert_eq!(report.migrations_run, vec![3, 2]);
+
+        // Verify only test1 table exists
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(tables, vec!["_migratio_version_", "test1"]);
+
+        // Verify tracking table shows only migration 1
+        let mut stmt = conn
+            .prepare("SELECT version FROM _migratio_version_ ORDER BY version")
+            .unwrap();
+        let versions: Vec<u32> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(versions, vec![1]);
+    }
+
+    #[test]
+    fn downgrade_all_migrations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test1", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test2", [])?;
+                Ok(())
+            }
+        }
+
+        // Apply migrations
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1, 2]);
+
+        // Rollback all migrations (target_version = 0)
+        let report = migrator.downgrade(&mut conn, 0).unwrap();
+        assert_eq!(report.migrations_run, vec![2, 1]);
+
+        // Verify no tables except tracking table
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(tables, vec!["_migratio_version_"]);
+
+        // Verify tracking table is empty
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*) FROM _migratio_version_")
+            .unwrap();
+        let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn downgrade_on_clean_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+            fn down(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        // Downgrade on clean database should succeed with no migrations run
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let report = migrator.downgrade(&mut conn, 0).unwrap();
+        assert_eq!(report.migrations_run, vec![] as Vec<u32>);
+        assert!(!report.schema_version_table_existed);
+    }
+
+    #[test]
+    fn downgrade_with_invalid_target_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test", [])?;
+                Ok(())
+            }
+        }
+
+        // Apply migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Try to downgrade to a version higher than current (should fail)
+        let result = migrator.downgrade(&mut conn, 5);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Cannot downgrade to version 5 when current version is 1"));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not support downgrade")]
+    fn downgrade_panics_when_down_not_implemented() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            // No down() implementation - uses default that panics
+        }
+
+        // Apply migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Try to downgrade - should panic
+        let _ = migrator.downgrade(&mut conn, 0);
+    }
+
+    #[test]
+    fn downgrade_validates_checksums() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1V1;
+        impl Migration for Migration1V1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test_table".to_string()
+            }
+        }
+
+        // Apply migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1V1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Try to downgrade with modified migration
+        struct Migration1V2;
+        impl Migration for Migration1V2 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test_table_modified".to_string() // Different!
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1V2)]);
+        let result = migrator.downgrade(&mut conn, 0);
+
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("checksum mismatch"));
     }
 }
