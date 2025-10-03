@@ -1,0 +1,25 @@
+[package]
+name = "migratio"
+version = "0.1.0"
+edition = "2021"
+description = "Write DB migrations in Rust (similar to Alembic), currently for SQLite."
+license = "MIT"   # SPDX ID(s)
+readme = "README.md"
+repository = "https://github.com/samgqroberts/migratio"
+homepage = "https://github.com/samgqroberts/migratio"
+documentation = "https://docs.rs/migratio"
+keywords = ["database", "migration", "sqlite"]
+categories = ["database", "development-tools"]
+authors = ["Sam Roberts <samgqroberts@gmail.com>"]
+
+[dependencies]
+chrono = "0.4.42"
+rusqlite = { version = "0.37.0", features = ["bundled", "backup"] }
+serde = "1.0.228"
+serde_json = "1.0.145"
+strum = "0.27.2"
+strum_macros = "0.27.2"
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.23.0"
