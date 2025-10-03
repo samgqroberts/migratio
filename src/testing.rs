@@ -107,19 +107,37 @@ impl MigrationTestHarness {
     }
 
     /// Migrate to a specific version.
+    ///
+    /// Returns an error if the target version does not exist in the migration list.
     pub fn migrate_to(&mut self, target_version: u32) -> Result<(), Error> {
+        // Validate target version exists (version 0 is always valid for empty state)
+        if target_version > 0 {
+            let version_exists = self
+                .migrator
+                .migrations()
+                .iter()
+                .any(|m| m.version() == target_version);
+            if !version_exists {
+                return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                    format!(
+                        "Migration version {} does not exist. Available versions: {}",
+                        target_version,
+                        self.migrator
+                            .migrations()
+                            .iter()
+                            .map(|m| m.version().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )));
+            }
+        }
+
         let current = self.current_version()?;
 
         if target_version > current {
-            // Migrate up
-            self.migrator.upgrade(&mut self.conn)?;
-
-            // Verify we reached the target (might need to run multiple times if target < max)
-            let new_current = self.current_version()?;
-            if new_current > target_version {
-                // Need to go back down
-                self.migrator.downgrade(&mut self.conn, target_version)?;
-            }
+            // Migrate up to target version
+            self.migrator.upgrade_to(&mut self.conn, target_version)?;
         } else if target_version < current {
             // Migrate down
             self.migrator.downgrade(&mut self.conn, target_version)?;
@@ -448,6 +466,19 @@ mod tests {
 
         harness.migrate_to(3).unwrap();
         assert_eq!(harness.current_version().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_migrate_to_nonexistent_version() {
+        let mut harness =
+            MigrationTestHarness::new(vec![Box::new(TestMigration1), Box::new(TestMigration2)]);
+
+        let result = harness.migrate_to(5);
+        assert!(result.is_err());
+
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Migration version 5 does not exist"));
+        assert!(err_msg.contains("Available versions: 1, 2"));
     }
 
     #[test]

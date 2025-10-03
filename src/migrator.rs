@@ -327,6 +327,11 @@ impl SqliteMigrator {
         self
     }
 
+    /// Get a reference to all migrations in this migrator.
+    pub fn migrations(&self) -> &[Box<dyn Migration>] {
+        &self.migrations
+    }
+
     /// Get the current migration version from the database.
     /// Returns 0 if no migrations have been applied.
     pub fn get_current_version(&self, conn: &mut Connection) -> Result<u32, Error> {
@@ -451,7 +456,43 @@ impl SqliteMigrator {
     /// Apply all previously-unapplied [Migration]s to the database with the given [Connection].
     /// Each migration runs within its own transaction, which is automatically rolled back if the migration fails.
     /// This method uses SQLite's busy timeout to handle concurrent migration attempts safely.
+    /// Upgrade the database to a specific target version.
+    ///
+    /// This runs all pending migrations up to and including the target version.
+    /// If the database is already at or beyond the target version, no migrations are run.
+    pub fn upgrade_to(
+        &self,
+        conn: &mut Connection,
+        target_version: u32,
+    ) -> Result<MigrationReport<'_>, Error> {
+        // Validate target version exists
+        if target_version > 0
+            && !self
+                .migrations
+                .iter()
+                .any(|m| m.version() == target_version)
+        {
+            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                format!(
+                    "Target version {} does not exist in migration list",
+                    target_version
+                ),
+            )));
+        }
+
+        self.upgrade_internal(conn, Some(target_version))
+    }
+
+    /// Upgrade the database by running all pending migrations.
     pub fn upgrade(&self, conn: &mut Connection) -> Result<MigrationReport<'_>, Error> {
+        self.upgrade_internal(conn, None)
+    }
+
+    fn upgrade_internal(
+        &self,
+        conn: &mut Connection,
+        target_version: Option<u32>,
+    ) -> Result<MigrationReport<'_>, Error> {
         // Set up concurrency protection
         self.setup_concurrency_protection(conn)?;
         // if schema version tracking table does not exist, create it
@@ -593,6 +634,13 @@ impl SqliteMigrator {
         // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
         let batch_applied_at = Utc::now().to_rfc3339();
         for (migration_version, migration) in migrations_sorted {
+            // Stop if we've reached the target version (if specified)
+            if let Some(target) = target_version {
+                if migration_version > target {
+                    break;
+                }
+            }
+
             if current_version < migration_version {
                 #[cfg(feature = "tracing")]
                 let _span = tracing::info_span!(
@@ -1052,6 +1100,98 @@ mod tests {
             .collect::<Result<Vec<i64>, rusqlite::Error>>()
             .unwrap();
         assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn upgrade_to_specific_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+            Box::new(Migration3),
+        ]);
+
+        // Upgrade to version 2 only
+        let report = migrator.upgrade_to(&mut conn, 2).unwrap();
+        assert_eq!(report.migrations_run, vec![1, 2]);
+
+        // Verify we're at version 2
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 2);
+
+        // Verify only tables for migrations 1 and 2 exist
+        let table_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('test1', 'test2', 'test3')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 2); // test1 and test2, but not test3
+
+        // Now upgrade to version 3
+        let report = migrator.upgrade_to(&mut conn, 3).unwrap();
+        assert_eq!(report.migrations_run, vec![3]);
+
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn upgrade_to_nonexistent_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+
+        let result = migrator.upgrade_to(&mut conn, 5);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Target version 5 does not exist"));
     }
 
     #[test]

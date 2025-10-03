@@ -388,7 +388,7 @@
 //!
 //! When enabled, migrations automatically emit tracing spans and events:
 //!
-//! ```rust,ignore
+//! ```rust
 //! use tracing_subscriber;
 //!
 //! // Set up tracing subscriber
@@ -411,7 +411,12 @@
 //! The `MigrationTestHarness` provides controlled migration state management, query helpers,
 //! and schema assertions:
 //!
-//! ```rust,ignore
+//! ```rust
+//! # #[cfg(not(feature = "testing"))]
+//! # fn main() {}
+//!
+//! # #[cfg(feature = "testing")]
+//! # fn main() {
 //! use migratio::testing::MigrationTestHarness;
 //! use migratio::{Migration, Error};
 //! use rusqlite::Transaction;
@@ -429,7 +434,7 @@
 //!     }
 //! }
 //!
-//! #[test]
+//! // in legitimate cases, this function would be a #[test]
 //! fn test_migration_1() {
 //!     let mut harness = MigrationTestHarness::new(vec![Box::new(Migration1)]);
 //!
@@ -452,28 +457,92 @@
 //!     harness.migrate_to(1).unwrap();
 //!     harness.assert_schema_matches(&schema_at_1).unwrap();
 //! }
+//! # test_migration_1();
+//! # }
 //! ```
 //!
 //! ## Testing Data Transformations
 //!
 //! The harness is particularly useful for testing complex data transformations:
 //!
-//! ```rust,ignore
-//! #[test]
+//! ```rust
+//! # #[cfg(not(feature = "testing"))]
+//! # fn main() {}
+//! #
+//! # #[cfg(feature = "testing")]
+//! # fn main() {
+//! use migratio::{Migration, SqliteMigrator, MigrationReport, Error, testing::MigrationTestHarness};
+//! use rusqlite::Transaction;
+//!
+//! struct Migration1;
+//! impl Migration for Migration1 {
+//!     fn version(&self) -> u32 {
+//!         1
+//!     }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute(
+//!             "CREATE TABLE user_preferences (name TEXT PRIMARY KEY, preferences TEXT)",
+//!             [],
+//!         )?;
+//!         Ok(())
+//!     }
+//! }
+//!
+//! struct Migration2;
+//! impl Migration for Migration2 {
+//!     fn version(&self) -> u32 {
+//!         2
+//!     }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         // read all user preferences
+//!         let mut stmt = tx.prepare("SELECT name, preferences FROM user_preferences")?;
+//!         let rows = stmt.query_map([], |row| {
+//!             let name: String = row.get(0)?;
+//!             let preferences: String = row.get(1)?;
+//!             Ok((name, preferences))
+//!         })?;
+//!
+//!         // transform the preferences data
+//!         for row in rows {
+//!             let (name, preferences) = row?;
+//!             let key_value_pairs = preferences
+//!                 .split("|")
+//!                 .map(|x| {
+//!                     let mut split = x.split(":");
+//!                     let key = split.next().unwrap();
+//!                     let value = split.next().unwrap();
+//!                     format!("\"{}\":\"{}\"", key, value)
+//!                 })
+//!                 .collect::<Vec<String>>();
+//!             let new_preferences = format!("{{{}}}", key_value_pairs.join(","));
+//!             tx.execute(
+//!                 "UPDATE user_preferences SET preferences = ? WHERE name = ?",
+//!                 [new_preferences, name],
+//!             )?;
+//!         }
+//!
+//!         Ok(())
+//!     }
+//! }
+//!
+//! // in legitimate cases, this function would be a #[test]
 //! fn test_data_transformation_migration() {
-//!     let mut harness = MigrationTestHarness::new(all_migrations());
+//!     let mut harness = MigrationTestHarness::new(vec![Box::new(Migration1), Box::new(Migration2)]);
 //!
 //!     // Set up test data in old format
 //!     harness.migrate_to(1).unwrap();
-//!     harness.execute("INSERT INTO prefs VALUES ('alice', 'theme:dark|help:off')").unwrap();
+//!     harness.execute("INSERT INTO user_preferences VALUES ('alice', 'theme:dark|help:off')").unwrap();
 //!
 //!     // Run migration that transforms data
 //!     harness.migrate_up_one().unwrap();
 //!
 //!     // Assert transformation succeeded
-//!     let prefs: String = harness.query_one("SELECT data FROM prefs WHERE name = 'alice'").unwrap();
+//!     let prefs: String = harness.query_one("SELECT preferences FROM user_preferences WHERE name = 'alice'").unwrap();
 //!     assert_eq!(prefs, r#"{"theme":"dark","help":"off"}"#);
 //! }
+//!
+//! # test_data_transformation_migration();
+//! # }
 //! ```
 //!
 //! ## Available Test Methods

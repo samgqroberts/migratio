@@ -32,3 +32,6 @@ tracing-test = "0.2"
 default = []
 tracing = ["dep:tracing"]
 testing = []
+
+[package.metadata.docs.rs]
+all_features = true
