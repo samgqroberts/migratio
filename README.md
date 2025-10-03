@@ -314,5 +314,38 @@ let current = migrator.get_current_version(&mut conn).unwrap();
 assert_eq!(current, 2);
 ```
 
+## Migration History
+
+Query the history of all applied migrations for auditing and debugging:
+
+```rust
+use migratio::{Migration, SqliteMigrator, Error};
+use rusqlite::{Connection, Transaction};
+
+struct Migration1;
+impl Migration for Migration1 {
+    fn version(&self) -> u32 { 1 }
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+        Ok(())
+    }
+    fn name(&self) -> String {
+        "create_users_table".to_string()
+    }
+}
+
+let mut conn = Connection::open_in_memory().unwrap();
+let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+migrator.upgrade(&mut conn).unwrap();
+
+// Get full migration history
+let history = migrator.get_migration_history(&mut conn).unwrap();
+for migration in &history {
+    println!("Migration {} ({})", migration.version, migration.name);
+    println!("  Applied at: {}", migration.applied_at.to_rfc3339());
+    println!("  Checksum: {}", migration.checksum);
+}
+```
+
 
 License: MIT

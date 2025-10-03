@@ -53,6 +53,20 @@ const DEFAULT_VERSION_TABLE_NAME: &str = "_migratio_version_";
 /// Optionally implement the `down` method to enable rollback support via [SqliteMigrator::downgrade].
 /// The `name` and `description` methods are optional, and only aid in debugging / observability.
 pub trait Migration {
+    /// Returns the version number of this migration.
+    ///
+    /// # IMPORTANT WARNING
+    ///
+    /// **Once a migration has been applied to any database, its version number must NEVER be changed.**
+    /// The version is used to track which migrations have been applied. Changing it will cause
+    /// the migrator to fail validation with an error about missing or orphaned migrations.
+    ///
+    /// # Requirements
+    ///
+    /// - Must be greater than 0
+    /// - Must be unique across all migrations
+    /// - Must be contiguous (1, 2, 3, ... with no gaps)
+    /// - Must be immutable once the migration is applied to any database
     fn version(&self) -> u32;
 
     fn up(&self, tx: &Transaction) -> Result<(), Error>;
@@ -67,11 +81,24 @@ pub trait Migration {
         )
     }
 
+    /// Returns the name of this migration.
+    ///
+    /// # IMPORTANT WARNING
+    ///
+    /// **Once a migration has been applied to any database, its name must NEVER be changed.**
+    /// The name is included in the checksum used to verify migration integrity. Changing it
+    /// will cause the migrator to fail with a checksum mismatch error.
+    ///
+    /// The default implementation returns "Migration {version}". You can override this to
+    /// provide a more descriptive name, but remember: once applied, it's permanent.
     fn name(&self) -> String {
         format!("Migration {}", self.version())
     }
 
-    // This default implementation does nothing
+    /// Returns an optional description of what this migration does.
+    ///
+    /// Unlike `version()` and `name()`, the description can be changed at any time as it's
+    /// not used for migration tracking or validation. Use this for human-readable documentation.
     fn description(&self) -> Option<&'static str> {
         None
     }
@@ -366,14 +393,15 @@ impl SqliteMigrator {
                     .collect::<Result<Vec<_>, _>>()?;
 
                 // Verify checksums match for migrations that were already applied
-                for (applied_version, applied_name, applied_checksum) in applied_migrations {
+                // Also detect missing migrations (in DB but not in code)
+                for (applied_version, applied_name, applied_checksum) in &applied_migrations {
                     if let Some(migration) = self
                         .migrations
                         .iter()
-                        .find(|m| m.version() == applied_version)
+                        .find(|m| m.version() == *applied_version)
                     {
                         let current_checksum = Self::calculate_checksum(migration);
-                        if current_checksum != applied_checksum {
+                        if current_checksum != *applied_checksum {
                             return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
                                 format!(
                                     "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
@@ -386,6 +414,50 @@ impl SqliteMigrator {
                                     migration.name()
                                 ),
                             )));
+                        }
+                    } else {
+                        // Migration exists in database but not in code - this is a missing migration
+                        return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                            format!(
+                                "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
+                                Applied migrations cannot be removed from the codebase.",
+                                applied_version,
+                                applied_name
+                            ),
+                        )));
+                    }
+                }
+
+                // Detect orphaned migrations (in code but applied migrations are not contiguous)
+                // For example: DB has [1, 2, 4] but code has [1, 2, 3, 4]
+                // This means migration 3 was added after migration 4 was already applied
+                let applied_versions: Vec<u32> =
+                    applied_migrations.iter().map(|(v, _, _)| *v).collect();
+                if !applied_versions.is_empty() {
+                    let max_applied = *applied_versions.iter().max().unwrap();
+
+                    // Check if all migrations up to max_applied exist in the database
+                    for expected_version in 1..=max_applied {
+                        if !applied_versions.contains(&expected_version) {
+                            // There's a gap - check if this migration exists in our code
+                            if let Some(missing_migration) = self
+                                .migrations
+                                .iter()
+                                .find(|m| m.version() == expected_version)
+                            {
+                                return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                                    format!(
+                                        "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
+                                        This likely means migration {} was added after migration {} was already applied. \
+                                        Applied migrations: {:?}",
+                                        expected_version,
+                                        missing_migration.name(),
+                                        expected_version,
+                                        max_applied,
+                                        applied_versions
+                                    ),
+                                )));
+                            }
                         }
                     }
                 }
@@ -516,14 +588,15 @@ impl SqliteMigrator {
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            for (applied_version, applied_name, applied_checksum) in applied_migrations {
+            // Verify checksums and detect missing migrations
+            for (applied_version, applied_name, applied_checksum) in &applied_migrations {
                 if let Some(migration) = self
                     .migrations
                     .iter()
-                    .find(|m| m.version() == applied_version)
+                    .find(|m| m.version() == *applied_version)
                 {
                     let current_checksum = Self::calculate_checksum(migration);
-                    if current_checksum != applied_checksum {
+                    if current_checksum != *applied_checksum {
                         return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
                             format!(
                                 "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
@@ -536,6 +609,46 @@ impl SqliteMigrator {
                                 migration.name()
                             ),
                         )));
+                    }
+                } else {
+                    // Migration exists in database but not in code
+                    return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                        format!(
+                            "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
+                            Applied migrations cannot be removed from the codebase.",
+                            applied_version,
+                            applied_name
+                        ),
+                    )));
+                }
+            }
+
+            // Detect orphaned migrations (gaps in applied migrations with code present)
+            let applied_versions: Vec<u32> =
+                applied_migrations.iter().map(|(v, _, _)| *v).collect();
+            if !applied_versions.is_empty() {
+                let max_applied = *applied_versions.iter().max().unwrap();
+
+                for expected_version in 1..=max_applied {
+                    if !applied_versions.contains(&expected_version) {
+                        if let Some(missing_migration) = self
+                            .migrations
+                            .iter()
+                            .find(|m| m.version() == expected_version)
+                        {
+                            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                                format!(
+                                    "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
+                                    This likely means migration {} was added after migration {} was already applied. \
+                                    Applied migrations: {:?}",
+                                    expected_version,
+                                    missing_migration.name(),
+                                    expected_version,
+                                    max_applied,
+                                    applied_versions
+                                ),
+                            )));
+                        }
                     }
                 }
             }
@@ -2643,5 +2756,226 @@ mod tests {
         // but we can verify the migration completed successfully with the custom setting)
         let current_version = migrator.get_current_version(&mut conn).unwrap();
         assert_eq!(current_version, 1);
+    }
+
+    #[test]
+    fn detects_missing_migration_in_code() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test1".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test2".to_string()
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test3".to_string()
+            }
+        }
+
+        // Apply all three migrations
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+            Box::new(Migration3),
+        ]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Now manually delete Migration2 from the database to simulate it being removed
+        conn.execute("DELETE FROM _migratio_version_ WHERE version = 2", [])
+            .unwrap();
+
+        // Now try to run with all migrations - should detect that Migration2 was in the DB
+        // but is now missing (we still have it in code, but DB shows it's gone)
+        // Actually, let's simulate the opposite: Migration2 WAS applied but we removed it from code
+        // We need to use a different Migration2 struct or manually manipulate the DB
+
+        // Let's manually insert a migration that doesn't exist in our code
+        conn.execute(
+            "INSERT INTO _migratio_version_ (version, name, applied_at, checksum) VALUES (4, 'deleted_migration', datetime('now'), 'fakechecksum')",
+            [],
+        )
+        .unwrap();
+
+        // Now try to upgrade - should detect migration 4 exists in DB but not in code
+        let result = migrator.upgrade(&mut conn);
+
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Migration 4"));
+        assert!(err_msg.contains("deleted_migration"));
+        assert!(err_msg.contains("was previously applied but is no longer present"));
+    }
+
+    #[test]
+    fn detects_orphaned_migration_added_late() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test1".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test2".to_string()
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test3".to_string()
+            }
+        }
+
+        // Apply migrations 1 and 3 only (simulating migration 2 being added later)
+        // First apply migration 1
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Manually insert migration 3 into the database to simulate it being applied
+        let checksum = {
+            let migration = Box::new(Migration3) as Box<dyn Migration>;
+            SqliteMigrator::calculate_checksum(&migration)
+        };
+        conn.execute(
+            "INSERT INTO _migratio_version_ (version, name, applied_at, checksum) VALUES (3, 'create_test3', datetime('now'), ?1)",
+            [&checksum],
+        )
+        .unwrap();
+
+        // Now try to upgrade with all three migrations
+        // This should fail because migration 2 exists in code but wasn't applied,
+        // yet migration 3 (which comes after it) was already applied
+        let migrator_all = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+            Box::new(Migration3),
+        ]);
+        let result = migrator_all.upgrade(&mut conn);
+
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Migration 2"));
+        assert!(err_msg.contains("create_test2"));
+        assert!(err_msg.contains("exists in code but was not applied"));
+        assert!(err_msg.contains("later migrations are already applied"));
+    }
+
+    #[test]
+    fn detects_missing_migration_during_downgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test1", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test1".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test2", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test2".to_string()
+            }
+        }
+
+        // Apply both migrations
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Manually insert a migration that doesn't exist in code
+        conn.execute(
+            "INSERT INTO _migratio_version_ (version, name, applied_at, checksum) VALUES (3, 'orphaned_migration', datetime('now'), 'fakechecksum')",
+            [],
+        )
+        .unwrap();
+
+        // Try to downgrade - should detect migration 3 exists in DB but not in code
+        let result = migrator.downgrade(&mut conn, 0);
+
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Migration 3"));
+        assert!(err_msg.contains("orphaned_migration"));
+        assert!(err_msg.contains("was previously applied but is no longer present"));
     }
 }
