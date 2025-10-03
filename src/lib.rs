@@ -8,7 +8,6 @@
 //!
 //! // define your migrations as structs that implement the Migration trait
 //! struct Migration1;
-//!
 //! impl Migration for Migration1 {
 //!     fn version(&self) -> u32 {
 //!         1
@@ -20,7 +19,6 @@
 //! }
 //!
 //! struct Migration2;
-//!
 //! impl Migration for Migration2 {
 //!     fn version(&self) -> u32 {
 //!         2
@@ -69,7 +67,6 @@
 //! use rusqlite::{Connection, Transaction};
 //!
 //! struct Migration1;
-//!
 //! impl Migration for Migration1 {
 //!     fn version(&self) -> u32 {
 //!         1
@@ -110,7 +107,6 @@
 //! // define another migration that transforms the user preferences data
 //! // using arbitrary Rust logic.
 //! struct Migration2;
-//!
 //! impl Migration for Migration2 {
 //!     fn version(&self) -> u32 {
 //!         2
@@ -216,14 +212,23 @@
 //! let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
 //! let report = migrator.upgrade(&mut conn).unwrap();
 //!
-//! // Check if any migration failed
-//! if let Some(failure) = &report.failing_migration {
-//!     eprintln!("Migration {} ('{}') failed!",
-//!         failure.migration().version(),
-//!         failure.migration().name());
-//!     // Successfully applied: [1]
-//!     assert_eq!(report.migrations_run, vec![1]);
-//! }
+//! // Expect the second migration has failed
+//! assert!(report.failing_migration.is_some());
+//! let failure = report.failing_migration.unwrap();
+//! assert_eq!(failure.migration().version(), 2);
+//! assert_eq!(failure.migration().name(), "Migration 2");
+//! assert_eq!(failure.error().to_string(), "near \"INVALID\": syntax error in INVALID SQL at offset 0");
+//!
+//! // Expect that the report indicates only the first migration was run
+//! assert_eq!(report.migrations_run, vec![1]);
+//!
+//! // The database is left in the state it was in after the last successful migration (here, version 1)
+//! assert_eq!(migrator.get_current_version(&mut conn).unwrap(), 1);
+//! let mut stmt = conn.prepare(
+//!    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1"
+//! ).unwrap();
+//! let count: i64 = stmt.query_row(["users"], |row| row.get(0)).unwrap();
+//! assert_eq!(count, 1);
 //! ```
 //!
 //! # Rollback Support
@@ -235,7 +240,6 @@
 //! use rusqlite::{Connection, Transaction};
 //!
 //! struct Migration1;
-//!
 //! impl Migration for Migration1 {
 //!     fn version(&self) -> u32 {
 //!         1
@@ -441,13 +445,13 @@
 //!     // Migrate to version 1
 //!     harness.migrate_to(1).unwrap();
 //!
+//!     // Convenience method: assert table exists
+//!     harness.assert_table_exists("users").unwrap();
+//!
 //!     // Insert test data
 //!     harness.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
 //!
-//!     // Assert table exists
-//!     harness.assert_table_exists("users").unwrap();
-//!
-//!     // Query data
+//!     // Convenience method: query one row
 //!     let name: String = harness.query_one("SELECT name FROM users WHERE id = 1").unwrap();
 //!     assert_eq!(name, "alice");
 //!
@@ -468,7 +472,6 @@
 //! ```rust
 //! # #[cfg(not(feature = "testing"))]
 //! # fn main() {}
-//! #
 //! # #[cfg(feature = "testing")]
 //! # fn main() {
 //! use migratio::{Migration, SqliteMigrator, MigrationReport, Error, testing::MigrationTestHarness};
@@ -540,7 +543,6 @@
 //!     let prefs: String = harness.query_one("SELECT preferences FROM user_preferences WHERE name = 'alice'").unwrap();
 //!     assert_eq!(prefs, r#"{"theme":"dark","help":"off"}"#);
 //! }
-//!
 //! # test_data_transformation_migration();
 //! # }
 //! ```

@@ -10,7 +10,6 @@ use rusqlite::{Connection, Transaction};
 
 // define your migrations as structs that implement the Migration trait
 struct Migration1;
-
 impl Migration for Migration1 {
     fn version(&self) -> u32 {
         1
@@ -22,7 +21,6 @@ impl Migration for Migration1 {
 }
 
 struct Migration2;
-
 impl Migration for Migration2 {
     fn version(&self) -> u32 {
         2
@@ -71,7 +69,6 @@ use migratio::{Migration, SqliteMigrator, MigrationReport, Error};
 use rusqlite::{Connection, Transaction};
 
 struct Migration1;
-
 impl Migration for Migration1 {
     fn version(&self) -> u32 {
         1
@@ -112,7 +109,6 @@ conn.execute(
 // define another migration that transforms the user preferences data
 // using arbitrary Rust logic.
 struct Migration2;
-
 impl Migration for Migration2 {
     fn version(&self) -> u32 {
         2
@@ -237,7 +233,6 @@ use migratio::{Migration, SqliteMigrator, Error};
 use rusqlite::{Connection, Transaction};
 
 struct Migration1;
-
 impl Migration for Migration1 {
     fn version(&self) -> u32 {
         1
@@ -439,13 +434,13 @@ fn test_migration_1() {
     // Migrate to version 1
     harness.migrate_to(1).unwrap();
 
+    // Convenience method: assert table exists
+    harness.assert_table_exists("users").unwrap();
+
     // Insert test data
     harness.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
 
-    // Assert table exists
-    harness.assert_table_exists("users").unwrap();
-
-    // Query data
+    // Convenience method: query one row
     let name: String = harness.query_one("SELECT name FROM users WHERE id = 1").unwrap();
     assert_eq!(name, "alice");
 
@@ -462,7 +457,6 @@ fn test_migration_1() {
 The harness is particularly useful for testing complex data transformations:
 
 ```rust
-#
 use migratio::{Migration, SqliteMigrator, MigrationReport, Error, testing::MigrationTestHarness};
 use rusqlite::Transaction;
 
@@ -532,7 +526,6 @@ fn test_data_transformation_migration() {
     let prefs: String = harness.query_one("SELECT preferences FROM user_preferences WHERE name = 'alice'").unwrap();
     assert_eq!(prefs, r#"{"theme":"dark","help":"off"}"#);
 }
-
 ```
 
 ### Available Test Methods
@@ -541,3 +534,6 @@ fn test_data_transformation_migration() {
 - **Queries**: `execute()`, `query_one()`, `query_all()`, `query_map()`
 - **Schema Assertions**: `assert_table_exists()`, `assert_column_exists()`, `assert_index_exists()`
 - **Schema Snapshots**: `capture_schema()`, `assert_schema_matches()`
+
+
+License: MIT
