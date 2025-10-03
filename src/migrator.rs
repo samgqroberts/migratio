@@ -1,6 +1,7 @@
 use crate::error::Error;
 use chrono::Utc;
 use rusqlite::{params, Connection, Transaction};
+use sha2::{Digest, Sha256};
 
 /// Represents a failure during a migration.
 #[derive(Debug, PartialEq)]
@@ -65,6 +66,16 @@ pub struct SqliteMigrator {
 }
 
 impl SqliteMigrator {
+    /// Calculate a checksum for a migration based on its version and name.
+    /// This is used to verify that migrations haven't been modified after being applied.
+    fn calculate_checksum(migration: &Box<dyn Migration>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(migration.version().to_string().as_bytes());
+        hasher.update(b"|");
+        hasher.update(migration.name().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
     /// Create a new SqliteMigrator, validating migration invariants.
     /// Returns an error if migrations are invalid.
     pub fn try_new(migrations: Vec<Box<dyn Migration>>) -> Result<Self, String> {
@@ -139,16 +150,68 @@ impl SqliteMigrator {
                 .next()?
                 .is_some();
             if !schema_version_table_existed {
-                // create table with name column
+                // create table with name and checksum columns
                 conn.execute(
                 &format!(
-                    "CREATE TABLE {} (version integer primary key not null, name text not null, applied_at text not null)",
+                    "CREATE TABLE {} (version integer primary key not null, name text not null, applied_at text not null, checksum text not null)",
                     self.schema_version_table_name
                 ),
                 [],)?;
             }
             schema_version_table_existed
         };
+
+        // Validate checksums of previously-applied migrations
+        if schema_version_table_existed {
+            // Check if the checksum column exists (for backwards compatibility)
+            let has_checksum_column = {
+                let mut stmt = conn.prepare(&format!(
+                    "PRAGMA table_info({})",
+                    self.schema_version_table_name
+                ))?;
+                let columns: Vec<String> = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                columns.contains(&"checksum".to_string())
+            };
+
+            if has_checksum_column {
+                // Get all applied migrations with their checksums
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT version, name, checksum FROM {}",
+                    self.schema_version_table_name
+                ))?;
+                let applied_migrations: Vec<(u32, String, String)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Verify checksums match for migrations that were already applied
+                for (applied_version, applied_name, applied_checksum) in applied_migrations {
+                    if let Some(migration) = self
+                        .migrations
+                        .iter()
+                        .find(|m| m.version() == applied_version)
+                    {
+                        let current_checksum = Self::calculate_checksum(migration);
+                        if current_checksum != applied_checksum {
+                            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                                format!(
+                                    "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
+                                    Migration name in DB: '{}', current name: '{}'. \
+                                    This indicates the migration was modified after being applied.",
+                                    applied_version,
+                                    applied_checksum,
+                                    current_checksum,
+                                    applied_name,
+                                    migration.name()
+                                ),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         // get current migration version (highest version number)
         let current_version: u32 = {
             let mut stmt = conn.prepare(&format!(
@@ -181,13 +244,16 @@ impl SqliteMigrator {
                         // Commit the transaction
                         tx.commit()?;
 
-                        // Insert a row for this migration with its name and the batch timestamp
+                        // Calculate checksum for this migration
+                        let checksum = Self::calculate_checksum(migration);
+
+                        // Insert a row for this migration with its name, timestamp, and checksum
                         conn.execute(
                             &format!(
-                                "INSERT INTO {} (version, name, applied_at) VALUES(?1, ?2, ?3)",
+                                "INSERT INTO {} (version, name, applied_at, checksum) VALUES(?1, ?2, ?3, ?4)",
                                 self.schema_version_table_name
                             ),
-                            params![migration_version, migration.name(), &batch_applied_at],
+                            params![migration_version, migration.name(), &batch_applied_at, checksum],
                         )?;
 
                         // record migration as run
@@ -946,5 +1012,140 @@ mod tests {
 
         let result = SqliteMigrator::try_new(vec![Box::new(Migration1), Box::new(Migration2)]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn checksum_validation_detects_modified_migration() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Define initial migration
+        struct Migration1V1;
+        impl Migration for Migration1V1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test_table".to_string()
+            }
+        }
+
+        // Run first migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1V1)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1]);
+
+        // Now define the same migration but with a different name (simulating modification)
+        struct Migration1V2;
+        impl Migration for Migration1V2 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test_table_modified".to_string() // Different name!
+            }
+        }
+
+        // Try to upgrade with modified migration - should fail
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1V2)]);
+        let result = migrator.upgrade(&mut conn);
+
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("checksum mismatch"));
+        assert!(err_msg.contains("Migration 1"));
+    }
+
+    #[test]
+    fn checksum_validation_passes_for_unmodified_migrations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Define migrations
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test1_table".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test2_table".to_string()
+            }
+        }
+
+        // Run first migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1]);
+
+        // Run both migrations (only second should execute)
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![2]);
+
+        // Run again - should succeed with no migrations run (validates checksums are still correct)
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![] as Vec<u32>);
+    }
+
+    #[test]
+    fn checksums_stored_in_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "my_migration".to_string()
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Verify checksum was stored
+        let mut stmt = conn
+            .prepare("SELECT checksum FROM _migratio_version_ WHERE version = 1")
+            .unwrap();
+        let checksum: String = stmt.query_row([], |row| row.get(0)).unwrap();
+
+        // Checksum should be a non-empty hex string (SHA-256 = 64 chars)
+        assert_eq!(checksum.len(), 64);
+        assert!(checksum.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Verify it matches the calculated checksum
+        let migration = Box::new(Migration1) as Box<dyn Migration>;
+        let expected_checksum = SqliteMigrator::calculate_checksum(&migration);
+        assert_eq!(checksum, expected_checksum);
     }
 }

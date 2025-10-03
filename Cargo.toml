@@ -17,6 +17,7 @@ chrono = "0.4.42"
 rusqlite = { version = "0.37.0", features = ["bundled", "backup"] }
 serde = "1.0.228"
 serde_json = "1.0.145"
+sha2 = "0.10"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 thiserror = "2.0.17"
