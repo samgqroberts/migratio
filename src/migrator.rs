@@ -99,9 +99,19 @@ impl std::fmt::Debug for dyn Migration {
 pub struct SqliteMigrator {
     migrations: Vec<Box<dyn Migration>>,
     schema_version_table_name: String,
+    busy_timeout: std::time::Duration,
 }
 
 impl SqliteMigrator {
+    /// Set up connection for safe concurrent access.
+    /// This sets a busy timeout so concurrent operations wait instead of failing immediately.
+    fn setup_concurrency_protection(&self, conn: &Connection) -> Result<(), Error> {
+        // Set the configured busy timeout
+        // This makes concurrent migration attempts wait instead of failing immediately
+        conn.busy_timeout(self.busy_timeout)?;
+        Ok(())
+    }
+
     /// Calculate a checksum for a migration based on its version and name.
     /// This is used to verify that migrations haven't been modified after being applied.
     fn calculate_checksum(migration: &Box<dyn Migration>) -> String {
@@ -155,6 +165,7 @@ impl SqliteMigrator {
         Ok(Self {
             migrations,
             schema_version_table_name: DEFAULT_VERSION_TABLE_NAME.to_string(),
+            busy_timeout: std::time::Duration::from_secs(30),
         })
     }
 
@@ -171,6 +182,14 @@ impl SqliteMigrator {
     /// Defaults to "_migratio_version_".
     pub fn with_schema_version_table_name(mut self, name: impl Into<String>) -> Self {
         self.schema_version_table_name = name.into();
+        self
+    }
+
+    /// Set the busy timeout for SQLite database operations.
+    /// This controls how long concurrent migration attempts will wait for locks.
+    /// Defaults to 30 seconds.
+    pub fn with_busy_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.busy_timeout = timeout;
         self
     }
 
@@ -297,7 +316,10 @@ impl SqliteMigrator {
 
     /// Apply all previously-unapplied [Migration]s to the database with the given [Connection].
     /// Each migration runs within its own transaction, which is automatically rolled back if the migration fails.
+    /// This method uses SQLite's busy timeout to handle concurrent migration attempts safely.
     pub fn upgrade(&self, conn: &mut Connection) -> Result<MigrationReport<'_>, Error> {
+        // Set up concurrency protection
+        self.setup_concurrency_protection(conn)?;
         // if schema version tracking table does not exist, create it
         let schema_version_table_existed = {
             let mut stmt =
@@ -308,9 +330,10 @@ impl SqliteMigrator {
                 .is_some();
             if !schema_version_table_existed {
                 // create table with name and checksum columns
+                // Use IF NOT EXISTS to handle concurrent creation attempts
                 conn.execute(
                 &format!(
-                    "CREATE TABLE {} (version integer primary key not null, name text not null, applied_at text not null, checksum text not null)",
+                    "CREATE TABLE IF NOT EXISTS {} (version integer primary key not null, name text not null, applied_at text not null, checksum text not null)",
                     self.schema_version_table_name
                 ),
                 [],)?;
@@ -443,11 +466,14 @@ impl SqliteMigrator {
     /// Pass `target_version = 0` to rollback all migrations.
     /// Each migration's `down()` method runs within its own transaction, which is automatically rolled back if it fails.
     /// Returns a [MigrationReport] describing which migrations were rolled back.
+    /// This method uses SQLite's busy timeout to handle concurrent migration attempts safely.
     pub fn downgrade(
         &self,
         conn: &mut Connection,
         target_version: u32,
     ) -> Result<MigrationReport<'_>, Error> {
+        // Set up concurrency protection
+        self.setup_concurrency_protection(conn)?;
         // Check if schema version table exists
         let schema_version_table_existed = {
             let mut stmt =
@@ -2351,5 +2377,271 @@ mod tests {
         let migration = Box::new(Migration1) as Box<dyn Migration>;
         let expected_checksum = SqliteMigrator::calculate_checksum(&migration);
         assert_eq!(history[0].checksum, expected_checksum);
+    }
+
+    #[test]
+    fn concurrent_migrations_are_safe() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use tempfile::NamedTempFile;
+
+        // Create a temporary database file
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                // Simulate some work
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                tx.execute("INSERT INTO test1 (id) VALUES (1)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test1", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                tx.execute("INSERT INTO test2 (id) VALUES (1)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test2", [])?;
+                Ok(())
+            }
+        }
+
+        // Create a barrier to synchronize thread starts
+        let barrier = Arc::new(Barrier::new(3));
+        let db_path_arc = Arc::new(db_path);
+
+        // Spawn 3 threads that all try to run migrations concurrently
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                let db_path = Arc::clone(&db_path_arc);
+                thread::spawn(move || {
+                    // Wait for all threads to be ready
+                    barrier.wait();
+
+                    // Each thread tries to upgrade
+                    let mut conn = Connection::open(db_path.as_str()).unwrap();
+                    let migrator =
+                        SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+                    let result = migrator.upgrade(&mut conn);
+
+                    // All threads should succeed (busy timeout allows them to wait)
+                    assert!(result.is_ok(), "Thread {} failed: {:?}", i, result);
+
+                    // Return only the migrations_run count
+                    result.unwrap().migrations_run.len()
+                })
+            })
+            .collect();
+
+        // Wait for all threads to complete
+        let migrations_run_counts: Vec<_> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let two_migrations = migrations_run_counts.iter().filter(|&&c| c == 2).count();
+        let zero_migrations = migrations_run_counts.iter().filter(|&&c| c == 0).count();
+
+        assert_eq!(
+            two_migrations, 1,
+            "Exactly one thread should have run 2 migrations"
+        );
+        assert_eq!(
+            zero_migrations, 2,
+            "Two threads should have found db already migrated"
+        );
+
+        // Verify final state
+        let mut conn = Connection::open(db_path_arc.as_str()).unwrap();
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let current_version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(current_version, 2);
+
+        // Verify both tables exist and have data
+        let count1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test1", [], |row| row.get(0))
+            .unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn concurrent_upgrade_and_downgrade() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use tempfile::NamedTempFile;
+
+        // Create a temporary database file
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+
+        // First, apply some migrations
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+
+            struct Migration1;
+            impl Migration for Migration1 {
+                fn version(&self) -> u32 {
+                    1
+                }
+                fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                    Ok(())
+                }
+                fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("DROP TABLE test1", [])?;
+                    Ok(())
+                }
+            }
+
+            struct Migration2;
+            impl Migration for Migration2 {
+                fn version(&self) -> u32 {
+                    2
+                }
+                fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                    Ok(())
+                }
+                fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("DROP TABLE test2", [])?;
+                    Ok(())
+                }
+            }
+
+            let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+            migrator.upgrade(&mut conn).unwrap();
+        }
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test1", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test2", [])?;
+                Ok(())
+            }
+        }
+
+        // Now spawn threads - some upgrading, some downgrading
+        let barrier = Arc::new(Barrier::new(4));
+        let db_path_arc = Arc::new(db_path);
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                let db_path = Arc::clone(&db_path_arc);
+                thread::spawn(move || {
+                    barrier.wait();
+
+                    let mut conn = Connection::open(db_path.as_str()).unwrap();
+                    let migrator =
+                        SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+
+                    let result = if i % 2 == 0 {
+                        // Even threads try to upgrade
+                        migrator.upgrade(&mut conn)
+                    } else {
+                        // Odd threads try to downgrade to version 1
+                        migrator.downgrade(&mut conn, 1)
+                    };
+
+                    // Assert success and return a simple value instead of the result
+                    assert!(result.is_ok(), "Thread {} got error: {:?}", i, result);
+                    true
+                })
+            })
+            .collect();
+
+        // All threads should complete successfully without panicking
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.join();
+            assert!(result.is_ok(), "Thread {} panicked", i);
+            assert!(result.unwrap(), "Thread {} failed", i);
+        }
+
+        // Database should be in a valid state (either version 1 or 2)
+        let mut conn = Connection::open(db_path_arc.as_str()).unwrap();
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let current_version = migrator.get_current_version(&mut conn).unwrap();
+        assert!(
+            current_version == 1 || current_version == 2,
+            "Version should be 1 or 2, got {}",
+            current_version
+        );
+    }
+
+    #[test]
+    fn custom_busy_timeout() {
+        use tempfile::NamedTempFile;
+
+        // Create a temporary database file
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        // Create migrator with custom 5-second timeout
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+            .with_busy_timeout(std::time::Duration::from_secs(5));
+
+        // Verify it can run migrations successfully
+        let mut conn = Connection::open(&db_path).unwrap();
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1]);
+
+        // Verify the custom timeout was applied (we can't directly test the timeout value,
+        // but we can verify the migration completed successfully with the custom setting)
+        let current_version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(current_version, 1);
     }
 }
