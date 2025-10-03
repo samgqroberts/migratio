@@ -57,45 +57,6 @@
 //! assert_eq!(columns, vec!["id", "name", "email"]);
 //! ```
 //!
-//! # Rollback Support
-//!
-//! Migrations can optionally implement the `down()` method to enable rollback via `downgrade()`:
-//!
-//! ```
-//! use migratio::{Migration, SqliteMigrator, Error};
-//! use rusqlite::{Connection, Transaction};
-//!
-//! struct Migration1;
-//!
-//! impl Migration for Migration1 {
-//!     fn version(&self) -> u32 {
-//!         1
-//!     }
-//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
-//!         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
-//!         Ok(())
-//!     }
-//!     fn down(&self, tx: &Transaction) -> Result<(), Error> {
-//!         tx.execute("DROP TABLE users", [])?;
-//!         Ok(())
-//!     }
-//! }
-//!
-//! let mut conn = Connection::open_in_memory().unwrap();
-//! let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
-//!
-//! // Apply migration
-//! migrator.upgrade(&mut conn).unwrap();
-//!
-//! // Rollback to version 0 (removes all migrations)
-//! migrator.downgrade(&mut conn, 0).unwrap();
-//!
-//! // Or rollback to a specific version
-//! // migrator.downgrade(&mut conn, 1).unwrap(); // Rollback to version 1
-//! ```
-//!
-//! If a migration doesn't implement `down()`, calling `downgrade()` will panic with a helpful error message.
-//!
 //! # Motivation
 //!
 //! Most Rust-based migration solutions focus only on using SQL to define migration logic.
@@ -222,6 +183,92 @@
 //!         )
 //!     ]
 //! );
+//! ```
+//!
+//! # Rollback Support
+//!
+//! Migrations can optionally implement the `down()` method to enable rollback via `downgrade()`:
+//!
+//! ```
+//! use migratio::{Migration, SqliteMigrator, Error};
+//! use rusqlite::{Connection, Transaction};
+//!
+//! struct Migration1;
+//!
+//! impl Migration for Migration1 {
+//!     fn version(&self) -> u32 {
+//!         1
+//!     }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
+//!         Ok(())
+//!     }
+//!     fn down(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("DROP TABLE users", [])?;
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let mut conn = Connection::open_in_memory().unwrap();
+//! let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+//!
+//! // Apply migration
+//! migrator.upgrade(&mut conn).unwrap();
+//!
+//! // Rollback to version 0 (removes all migrations)
+//! migrator.downgrade(&mut conn, 0).unwrap();
+//!
+//! // Or rollback to a specific version
+//! // migrator.downgrade(&mut conn, 1).unwrap(); // Rollback to version 1
+//! ```
+//!
+//! If a migration doesn't implement `down()`, calling `downgrade()` will panic with a helpful error message.
+//!
+//! # Preview / Dry-Run Mode
+//!
+//! Preview which migrations would be applied or rolled back without actually running them:
+//!
+//! ```
+//! use migratio::{Migration, SqliteMigrator, Error};
+//! use rusqlite::{Connection, Transaction};
+//!
+//! struct Migration1;
+//! impl Migration for Migration1 {
+//!     fn version(&self) -> u32 { 1 }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+//!         Ok(())
+//!     }
+//! }
+//!
+//! struct Migration2;
+//! impl Migration for Migration2 {
+//!     fn version(&self) -> u32 { 2 }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("ALTER TABLE users ADD COLUMN email TEXT", [])?;
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let mut conn = Connection::open_in_memory().unwrap();
+//! let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+//!
+//! // Preview pending migrations
+//! let pending = migrator.preview_upgrade(&mut conn).unwrap();
+//! assert_eq!(pending.len(), 2);
+//! assert_eq!(pending[0].version(), 1);
+//! assert_eq!(pending[1].version(), 2);
+//!
+//! // Actually apply them
+//! migrator.upgrade(&mut conn).unwrap();
+//!
+//! // Preview what would be rolled back
+//! let to_rollback = migrator.preview_downgrade(&mut conn, 0).unwrap();
+//! assert_eq!(to_rollback.len(), 2);
+//!
+//! // Check current version
+//! let current = migrator.get_current_version(&mut conn).unwrap();
+//! assert_eq!(current, 2);
 //! ```
 //!
 

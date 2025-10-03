@@ -149,6 +149,77 @@ impl SqliteMigrator {
         self
     }
 
+    /// Get the current migration version from the database.
+    /// Returns 0 if no migrations have been applied.
+    pub fn get_current_version(&self, conn: &mut Connection) -> Result<u32, Error> {
+        // Check if schema version table exists
+        let mut stmt =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
+        let table_exists = stmt
+            .query([&self.schema_version_table_name])?
+            .next()?
+            .is_some();
+
+        if !table_exists {
+            return Ok(0);
+        }
+
+        // Get current version (highest version number)
+        let mut stmt = conn.prepare(&format!(
+            "SELECT MAX(version) from {}",
+            self.schema_version_table_name
+        ))?;
+        let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
+        Ok(version.unwrap_or(0))
+    }
+
+    /// Preview which migrations would be applied by `upgrade()` without actually running them.
+    /// Returns a list of migrations that would be executed, in the order they would run.
+    pub fn preview_upgrade(
+        &self,
+        conn: &mut Connection,
+    ) -> Result<Vec<&Box<dyn Migration>>, Error> {
+        let current_version = self.get_current_version(conn)?;
+
+        let mut pending_migrations = self
+            .migrations
+            .iter()
+            .filter(|m| m.version() > current_version)
+            .collect::<Vec<_>>();
+        pending_migrations.sort_by_key(|m| m.version());
+
+        Ok(pending_migrations)
+    }
+
+    /// Preview which migrations would be rolled back by `downgrade(target_version)` without actually running them.
+    /// Returns a list of migrations that would be executed, in the order they would run (reverse order).
+    pub fn preview_downgrade(
+        &self,
+        conn: &mut Connection,
+        target_version: u32,
+    ) -> Result<Vec<&Box<dyn Migration>>, Error> {
+        let current_version = self.get_current_version(conn)?;
+
+        // Validate target version
+        if target_version > current_version {
+            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                format!(
+                    "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
+                    target_version, current_version
+                ),
+            )));
+        }
+
+        let mut migrations_to_rollback = self
+            .migrations
+            .iter()
+            .filter(|m| m.version() > target_version && m.version() <= current_version)
+            .collect::<Vec<_>>();
+        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.version())); // Reverse order
+
+        Ok(migrations_to_rollback)
+    }
+
     /// Apply all previously-unapplied [Migration]s to the database with the given [Connection].
     /// Each migration runs within its own transaction, which is automatically rolled back if the migration fails.
     pub fn upgrade(&self, conn: &mut Connection) -> Result<MigrationReport<'_>, Error> {
@@ -1638,5 +1709,325 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(err_msg.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn get_current_version_on_clean_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn get_current_version_after_migrations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+
+        // Before any migrations
+        assert_eq!(migrator.get_current_version(&mut conn).unwrap(), 0);
+
+        // After first migration
+        migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(migrator.get_current_version(&mut conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn preview_upgrade_on_clean_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let pending = migrator.preview_upgrade(&mut conn).unwrap();
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].version(), 1);
+        assert_eq!(pending[1].version(), 2);
+    }
+
+    #[test]
+    fn preview_upgrade_with_partial_migrations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        // Apply first migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Preview with all three migrations
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+            Box::new(Migration3),
+        ]);
+        let pending = migrator.preview_upgrade(&mut conn).unwrap();
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].version(), 2);
+        assert_eq!(pending[1].version(), 3);
+    }
+
+    #[test]
+    fn preview_upgrade_when_up_to_date() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let pending = migrator.preview_upgrade(&mut conn).unwrap();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn preview_downgrade_to_zero() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test1", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test2", [])?;
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let to_rollback = migrator.preview_downgrade(&mut conn, 0).unwrap();
+
+        assert_eq!(to_rollback.len(), 2);
+        assert_eq!(to_rollback[0].version(), 2); // Reverse order
+        assert_eq!(to_rollback[1].version(), 1);
+    }
+
+    #[test]
+    fn preview_downgrade_to_specific_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test1", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test2", [])?;
+                Ok(())
+            }
+        }
+
+        struct Migration3;
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test3", [])?;
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+            Box::new(Migration3),
+        ]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let to_rollback = migrator.preview_downgrade(&mut conn, 1).unwrap();
+
+        assert_eq!(to_rollback.len(), 2);
+        assert_eq!(to_rollback[0].version(), 3); // Reverse order
+        assert_eq!(to_rollback[1].version(), 2);
+    }
+
+    #[test]
+    fn preview_downgrade_on_clean_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+            fn down(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let to_rollback = migrator.preview_downgrade(&mut conn, 0).unwrap();
+
+        assert_eq!(to_rollback.len(), 0);
+    }
+
+    #[test]
+    fn preview_downgrade_with_invalid_target() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        let result = migrator.preview_downgrade(&mut conn, 5);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Cannot downgrade to version 5 when current version is 1"));
     }
 }
