@@ -6,7 +6,7 @@
 
 ```rust
 use migratio::{Migration, SqliteMigrator, MigrationReport, Error};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
 // define your migrations as structs that implement the Migration trait
 struct Migration1;
@@ -15,8 +15,8 @@ impl Migration for Migration1 {
     fn version(&self) -> u32 {
         1
     }
-    fn up(&self, conn: &mut Connection) -> Result<(), Error> {
-        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
         Ok(())
     }
 }
@@ -27,8 +27,8 @@ impl Migration for Migration2 {
     fn version(&self) -> u32 {
         2
     }
-    fn up(&self, conn: &mut Connection) -> Result<(), Error> {
-        conn.execute("ALTER TABLE users ADD COLUMN email TEXT", [])?;
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("ALTER TABLE users ADD COLUMN email TEXT", [])?;
         Ok(())
     }
 }
@@ -68,7 +68,7 @@ SeaORM allows this, but this library aims to provide an alternative for develope
 
 ```rust
 use migratio::{Migration, SqliteMigrator, MigrationReport, Error};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
 struct Migration1;
 
@@ -76,8 +76,8 @@ impl Migration for Migration1 {
     fn version(&self) -> u32 {
         1
     }
-    fn up(&self, conn: &mut Connection) -> Result<(), Error> {
-        conn.execute(
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute(
             "CREATE TABLE user_preferences (name TEXT PRIMARY KEY, preferences TEXT)",
             [],
         )?;
@@ -117,9 +117,9 @@ impl Migration for Migration2 {
     fn version(&self) -> u32 {
         2
     }
-    fn up(&self, conn: &mut Connection) -> Result<(), Error> {
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
         // read all user preferences
-        let mut stmt = conn.prepare("SELECT name, preferences FROM user_preferences")?;
+        let mut stmt = tx.prepare("SELECT name, preferences FROM user_preferences")?;
         let rows = stmt.query_map([], |row| {
             let name: String = row.get(0)?;
             let preferences: String = row.get(1)?;
@@ -139,7 +139,7 @@ impl Migration for Migration2 {
                 })
                 .collect::<Vec<String>>();
             let new_preferences = format!("{{{}}}", key_value_pairs.join(","));
-            conn.execute(
+            tx.execute(
                 "UPDATE user_preferences SET preferences = ? WHERE name = ?",
                 [new_preferences, name],
             )?;
