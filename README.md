@@ -187,6 +187,47 @@ assert_eq!(
 );
 ```
 
+## Error Handling
+
+When migrations fail, you can inspect the failure details:
+
+```rust
+use migratio::{Migration, SqliteMigrator, Error};
+use rusqlite::{Connection, Transaction};
+
+struct Migration1;
+impl Migration for Migration1 {
+    fn version(&self) -> u32 { 1 }
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+        Ok(())
+    }
+}
+
+struct Migration2;
+impl Migration for Migration2 {
+    fn version(&self) -> u32 { 2 }
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        // This will fail
+        tx.execute("INVALID SQL", [])?;
+        Ok(())
+    }
+}
+
+let mut conn = Connection::open_in_memory().unwrap();
+let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+let report = migrator.upgrade(&mut conn).unwrap();
+
+// Check if any migration failed
+if let Some(failure) = &report.failing_migration {
+    eprintln!("Migration {} ('{}') failed!",
+        failure.migration().version(),
+        failure.migration().name());
+    // Successfully applied: [1]
+    assert_eq!(report.migrations_run, vec![1]);
+}
+```
+
 ## Rollback Support
 
 Migrations can optionally implement the `down()` method to enable rollback via `downgrade()`:

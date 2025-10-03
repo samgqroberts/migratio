@@ -10,6 +10,18 @@ pub struct MigrationFailure<'migration> {
     error: Error,
 }
 
+impl<'migration> MigrationFailure<'migration> {
+    /// Get the migration that failed.
+    pub fn migration(&self) -> &dyn Migration {
+        self.migration.as_ref()
+    }
+
+    /// Get the error that caused the migration to fail.
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+}
+
 /// A report of actions performed during a migration.
 #[derive(Debug, PartialEq)]
 pub struct MigrationReport<'migration> {
@@ -2029,5 +2041,88 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(err_msg.contains("Cannot downgrade to version 5 when current version is 1"));
+    }
+
+    #[test]
+    fn migration_failure_accessors() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "create_test_table".to_string()
+            }
+        }
+
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                // Intentionally fail
+                tx.execute("INVALID SQL HERE", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "failing_migration".to_string()
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Check that we can access the failure
+        assert!(report.failing_migration.is_some());
+
+        let failure = report.failing_migration.as_ref().unwrap();
+
+        // Test migration accessor
+        let migration = failure.migration();
+        assert_eq!(migration.version(), 2);
+        assert_eq!(migration.name(), "failing_migration");
+
+        // Test error accessor
+        let error = failure.error();
+        assert!(matches!(error, Error::Rusqlite(_)));
+    }
+
+    #[test]
+    fn migration_failure_can_be_pattern_matched() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("INVALID SQL", [])?;
+                Ok(())
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Demonstrate pattern matching on the failure
+        match report.failing_migration {
+            Some(ref failure) => {
+                println!(
+                    "Migration {} failed: {:?}",
+                    failure.migration().version(),
+                    failure.error()
+                );
+                assert_eq!(failure.migration().version(), 1);
+            }
+            None => panic!("Expected a failure"),
+        }
     }
 }
