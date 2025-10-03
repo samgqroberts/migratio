@@ -2,6 +2,7 @@ use crate::error::Error;
 use chrono::Utc;
 use rusqlite::{params, Connection, Transaction};
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 
 /// Represents a failure during a migration.
 #[derive(Debug, PartialEq)]
@@ -122,11 +123,30 @@ impl std::fmt::Debug for dyn Migration {
 /// The entrypoint for running a sequence of [Migration]s.
 /// Construct this struct with the list of all [Migration]s to be applied.
 /// [Migration::version]s must be contiguous, greater than zero, and unique.
-#[derive(Debug)]
 pub struct SqliteMigrator {
     migrations: Vec<Box<dyn Migration>>,
     schema_version_table_name: String,
     busy_timeout: std::time::Duration,
+    on_migration_start: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
+    on_migration_complete: Option<Box<dyn Fn(u32, &str, std::time::Duration) + Send + Sync>>,
+    on_migration_error: Option<Box<dyn Fn(u32, &str, &Error) + Send + Sync>>,
+}
+
+// Manual Debug impl since closures don't implement Debug
+impl std::fmt::Debug for SqliteMigrator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteMigrator")
+            .field("migrations", &self.migrations)
+            .field("schema_version_table_name", &self.schema_version_table_name)
+            .field("busy_timeout", &self.busy_timeout)
+            .field("on_migration_start", &self.on_migration_start.is_some())
+            .field(
+                "on_migration_complete",
+                &self.on_migration_complete.is_some(),
+            )
+            .field("on_migration_error", &self.on_migration_error.is_some())
+            .finish()
+    }
 }
 
 impl SqliteMigrator {
@@ -193,6 +213,9 @@ impl SqliteMigrator {
             migrations,
             schema_version_table_name: DEFAULT_VERSION_TABLE_NAME.to_string(),
             busy_timeout: std::time::Duration::from_secs(30),
+            on_migration_start: None,
+            on_migration_complete: None,
+            on_migration_error: None,
         })
     }
 
@@ -217,6 +240,90 @@ impl SqliteMigrator {
     /// Defaults to 30 seconds.
     pub fn with_busy_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.busy_timeout = timeout;
+        self
+    }
+
+    /// Set a callback to be invoked when a migration starts.
+    /// The callback receives the migration version and name.
+    ///
+    /// # Example
+    /// ```
+    /// use migratio::SqliteMigrator;
+    /// # use migratio::Migration;
+    /// # use rusqlite::Transaction;
+    /// # use migratio::Error;
+    ///
+    /// # struct Migration1;
+    /// # impl Migration for Migration1 {
+    /// #     fn version(&self) -> u32 { 1 }
+    /// #     fn up(&self, tx: &Transaction) -> Result<(), Error> { Ok(()) }
+    /// # }
+    /// let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+    ///     .on_migration_start(|version, name| {
+    ///         println!("Starting migration {} ({})", version, name);
+    ///     });
+    /// ```
+    pub fn on_migration_start<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u32, &str) + Send + Sync + 'static,
+    {
+        self.on_migration_start = Some(Box::new(callback));
+        self
+    }
+
+    /// Set a callback to be invoked when a migration completes successfully.
+    /// The callback receives the migration version, name, and duration.
+    ///
+    /// # Example
+    /// ```
+    /// use migratio::SqliteMigrator;
+    /// # use migratio::Migration;
+    /// # use rusqlite::Transaction;
+    /// # use migratio::Error;
+    ///
+    /// # struct Migration1;
+    /// # impl Migration for Migration1 {
+    /// #     fn version(&self) -> u32 { 1 }
+    /// #     fn up(&self, tx: &Transaction) -> Result<(), Error> { Ok(()) }
+    /// # }
+    /// let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+    ///     .on_migration_complete(|version, name, duration| {
+    ///         println!("Migration {} ({}) completed in {:?}", version, name, duration);
+    ///     });
+    /// ```
+    pub fn on_migration_complete<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u32, &str, std::time::Duration) + Send + Sync + 'static,
+    {
+        self.on_migration_complete = Some(Box::new(callback));
+        self
+    }
+
+    /// Set a callback to be invoked when a migration fails.
+    /// The callback receives the migration version, name, and error.
+    ///
+    /// # Example
+    /// ```
+    /// use migratio::SqliteMigrator;
+    /// # use migratio::Migration;
+    /// # use rusqlite::Transaction;
+    /// # use migratio::Error;
+    ///
+    /// # struct Migration1;
+    /// # impl Migration for Migration1 {
+    /// #     fn version(&self) -> u32 { 1 }
+    /// #     fn up(&self, tx: &Transaction) -> Result<(), Error> { Ok(()) }
+    /// # }
+    /// let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+    ///     .on_migration_error(|version, name, error| {
+    ///         eprintln!("Migration {} ({}) failed: {:?}", version, name, error);
+    ///     });
+    /// ```
+    pub fn on_migration_error<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u32, &str, &Error) + Send + Sync + 'static,
+    {
+        self.on_migration_error = Some(Box::new(callback));
         self
     }
 
@@ -487,6 +594,24 @@ impl SqliteMigrator {
         let batch_applied_at = Utc::now().to_rfc3339();
         for (migration_version, migration) in migrations_sorted {
             if current_version < migration_version {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!(
+                    "migration_up",
+                    version = migration_version,
+                    name = %migration.name()
+                )
+                .entered();
+
+                #[cfg(feature = "tracing")]
+                tracing::info!("Starting migration");
+
+                // Call on_migration_start hook
+                if let Some(ref callback) = self.on_migration_start {
+                    callback(migration_version, &migration.name());
+                }
+
+                let migration_start = Instant::now();
+
                 // Start a transaction for this migration
                 let tx = conn.transaction()?;
                 let migration_result = migration.up(&tx);
@@ -495,6 +620,14 @@ impl SqliteMigrator {
                     Ok(_) => {
                         // Commit the transaction
                         tx.commit()?;
+
+                        let migration_duration = migration_start.elapsed();
+
+                        #[cfg(feature = "tracing")]
+                        tracing::info!(
+                            duration_ms = migration_duration.as_millis(),
+                            "Migration completed successfully"
+                        );
 
                         // Calculate checksum for this migration
                         let checksum = Self::calculate_checksum(migration);
@@ -513,8 +646,24 @@ impl SqliteMigrator {
                         // also, since any migration succeeded, if schema version table had not originally existed,
                         // we can mark that it was created
                         schema_version_table_created = true;
+
+                        // Call on_migration_complete hook
+                        if let Some(ref callback) = self.on_migration_complete {
+                            callback(migration_version, &migration.name(), migration_duration);
+                        }
                     }
                     Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            error = %e,
+                            "Migration failed"
+                        );
+
+                        // Call on_migration_error hook
+                        if let Some(ref callback) = self.on_migration_error {
+                            callback(migration_version, &migration.name(), &e);
+                        }
+
                         // Transaction will be automatically rolled back when dropped
                         failing_migration = Some(MigrationFailure {
                             migration,
@@ -687,6 +836,24 @@ impl SqliteMigrator {
         let mut failing_migration: Option<MigrationFailure> = None;
 
         for (migration_version, migration) in migrations_to_rollback {
+            #[cfg(feature = "tracing")]
+            let _span = tracing::info_span!(
+                "migration_down",
+                version = migration_version,
+                name = %migration.name()
+            )
+            .entered();
+
+            #[cfg(feature = "tracing")]
+            tracing::info!("Rolling back migration");
+
+            // Call on_migration_start hook
+            if let Some(ref callback) = self.on_migration_start {
+                callback(migration_version, &migration.name());
+            }
+
+            let migration_start = Instant::now();
+
             // Start a transaction for this migration rollback
             let tx = conn.transaction()?;
             let migration_result = migration.down(&tx);
@@ -695,6 +862,14 @@ impl SqliteMigrator {
                 Ok(_) => {
                     // Commit the transaction
                     tx.commit()?;
+
+                    let migration_duration = migration_start.elapsed();
+
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        duration_ms = migration_duration.as_millis(),
+                        "Migration rolled back successfully"
+                    );
 
                     // Delete this migration from the tracking table
                     conn.execute(
@@ -707,8 +882,24 @@ impl SqliteMigrator {
 
                     // record migration as rolled back
                     migrations_run.push(migration_version);
+
+                    // Call on_migration_complete hook
+                    if let Some(ref callback) = self.on_migration_complete {
+                        callback(migration_version, &migration.name(), migration_duration);
+                    }
                 }
                 Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(
+                        error = %e,
+                        "Migration rollback failed"
+                    );
+
+                    // Call on_migration_error hook
+                    if let Some(ref callback) = self.on_migration_error {
+                        callback(migration_version, &migration.name(), &e);
+                    }
+
                     // Transaction will be automatically rolled back when dropped
                     failing_migration = Some(MigrationFailure {
                         migration,
@@ -2977,5 +3168,305 @@ mod tests {
         assert!(err_msg.contains("Migration 3"));
         assert!(err_msg.contains("orphaned_migration"));
         assert!(err_msg.contains("was previously applied but is no longer present"));
+    }
+
+    #[test]
+    fn hooks_are_called_on_successful_migration() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "test_migration".to_string()
+            }
+        }
+
+        let start_calls = Arc::new(Mutex::new(Vec::new()));
+        let complete_calls = Arc::new(Mutex::new(Vec::new()));
+        let error_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let start_calls_clone = Arc::clone(&start_calls);
+        let complete_calls_clone = Arc::clone(&complete_calls);
+        let error_calls_clone = Arc::clone(&error_calls);
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+            .on_migration_start(move |version, name| {
+                start_calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((version, name.to_string()));
+            })
+            .on_migration_complete(move |version, name, duration| {
+                complete_calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((version, name.to_string(), duration));
+            })
+            .on_migration_error(move |version, name, error| {
+                error_calls_clone.lock().unwrap().push((
+                    version,
+                    name.to_string(),
+                    format!("{:?}", error),
+                ));
+            });
+
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Verify hooks were called correctly
+        let starts = start_calls.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0], (1, "test_migration".to_string()));
+
+        let completes = complete_calls.lock().unwrap();
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0].0, 1);
+        assert_eq!(completes[0].1, "test_migration");
+        // Duration is always non-negative, just verify it exists
+        let _ = completes[0].2;
+
+        let errors = error_calls.lock().unwrap();
+        assert_eq!(errors.len(), 0); // No errors should have been called
+    }
+
+    #[test]
+    fn hooks_are_called_on_failed_migration() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("INVALID SQL", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "failing_migration".to_string()
+            }
+        }
+
+        let start_calls = Arc::new(Mutex::new(Vec::new()));
+        let complete_calls = Arc::new(Mutex::new(Vec::new()));
+        let error_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let start_calls_clone = Arc::clone(&start_calls);
+        let complete_calls_clone = Arc::clone(&complete_calls);
+        let error_calls_clone = Arc::clone(&error_calls);
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+            .on_migration_start(move |version, name| {
+                start_calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((version, name.to_string()));
+            })
+            .on_migration_complete(move |version, name, duration| {
+                complete_calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((version, name.to_string(), duration));
+            })
+            .on_migration_error(move |version, name, _error| {
+                error_calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((version, name.to_string()));
+            });
+
+        let _ = migrator.upgrade(&mut conn); // Expect this to fail
+
+        // Verify hooks were called correctly
+        let starts = start_calls.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0], (1, "failing_migration".to_string()));
+
+        let completes = complete_calls.lock().unwrap();
+        assert_eq!(completes.len(), 0); // Complete should not be called on error
+
+        let errors = error_calls.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0], (1, "failing_migration".to_string()));
+    }
+
+    #[test]
+    fn hooks_are_called_on_downgrade() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE test", [])?;
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "test_migration".to_string()
+            }
+        }
+
+        // First apply the migration
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Now set up hooks for downgrade
+        let start_calls = Arc::new(Mutex::new(Vec::new()));
+        let complete_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let start_calls_clone = Arc::clone(&start_calls);
+        let complete_calls_clone = Arc::clone(&complete_calls);
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+            .on_migration_start(move |version, name| {
+                start_calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((version, name.to_string()));
+            })
+            .on_migration_complete(move |version, name, duration| {
+                complete_calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((version, name.to_string(), duration));
+            });
+
+        migrator.downgrade(&mut conn, 0).unwrap();
+
+        // Verify hooks were called
+        let starts = start_calls.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0], (1, "test_migration".to_string()));
+
+        let completes = complete_calls.lock().unwrap();
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0].0, 1);
+        assert_eq!(completes[0].1, "test_migration");
+    }
+
+    #[test]
+    #[cfg(feature = "tracing")]
+    fn tracing_logs_successful_migration() {
+        use tracing_test::traced_test;
+
+        #[traced_test]
+        fn run_test() {
+            let mut conn = Connection::open_in_memory().unwrap();
+
+            struct Migration1;
+            impl Migration for Migration1 {
+                fn version(&self) -> u32 {
+                    1
+                }
+                fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                    Ok(())
+                }
+                fn name(&self) -> String {
+                    "test_migration".to_string()
+                }
+            }
+
+            let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+            migrator.upgrade(&mut conn).unwrap();
+
+            // Verify tracing logs were emitted
+            assert!(logs_contain("Starting migration"));
+            assert!(logs_contain("Migration completed successfully"));
+            assert!(logs_contain("duration_ms"));
+        }
+
+        run_test();
+    }
+
+    #[test]
+    #[cfg(feature = "tracing")]
+    fn tracing_logs_failed_migration() {
+        use tracing_test::traced_test;
+
+        #[traced_test]
+        fn run_test() {
+            let mut conn = Connection::open_in_memory().unwrap();
+
+            struct Migration1;
+            impl Migration for Migration1 {
+                fn version(&self) -> u32 {
+                    1
+                }
+                fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("INVALID SQL", [])?;
+                    Ok(())
+                }
+                fn name(&self) -> String {
+                    "failing_migration".to_string()
+                }
+            }
+
+            let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+            let _ = migrator.upgrade(&mut conn);
+
+            // Verify tracing error logs were emitted
+            assert!(logs_contain("Starting migration"));
+            assert!(logs_contain("Migration failed"));
+        }
+
+        run_test();
+    }
+
+    #[test]
+    #[cfg(feature = "tracing")]
+    fn tracing_logs_downgrade() {
+        use tracing_test::traced_test;
+
+        #[traced_test]
+        fn run_test() {
+            let mut conn = Connection::open_in_memory().unwrap();
+
+            struct Migration1;
+            impl Migration for Migration1 {
+                fn version(&self) -> u32 {
+                    1
+                }
+                fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+                    Ok(())
+                }
+                fn down(&self, tx: &Transaction) -> Result<(), Error> {
+                    tx.execute("DROP TABLE test", [])?;
+                    Ok(())
+                }
+                fn name(&self) -> String {
+                    "test_migration".to_string()
+                }
+            }
+
+            let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+            migrator.upgrade(&mut conn).unwrap();
+            migrator.downgrade(&mut conn, 0).unwrap();
+
+            // Verify tracing logs for downgrade were emitted
+            assert!(logs_contain("Rolling back migration"));
+            assert!(logs_contain("Migration rolled back successfully"));
+        }
+
+        run_test();
     }
 }

@@ -347,5 +347,59 @@ for migration in &history {
 }
 ```
 
+## Observability Hooks
+
+Set callbacks to observe migration progress, useful for logging and metrics:
+
+```rust
+use migratio::{Migration, SqliteMigrator, Error};
+use rusqlite::{Connection, Transaction};
+
+struct Migration1;
+impl Migration for Migration1 {
+    fn version(&self) -> u32 { 1 }
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+        Ok(())
+    }
+}
+
+let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+    .on_migration_start(|version, name| {
+        println!("Starting migration {} ({})", version, name);
+    })
+    .on_migration_complete(|version, name, duration| {
+        println!("Migration {} ({}) completed in {:?}", version, name, duration);
+    })
+    .on_migration_error(|version, name, error| {
+        eprintln!("Migration {} ({}) failed: {:?}", version, name, error);
+    });
+
+let mut conn = Connection::open_in_memory().unwrap();
+migrator.upgrade(&mut conn).unwrap();
+```
+
+## Tracing Integration
+
+Enable the `tracing` feature for automatic structured logging using the `tracing` crate:
+
+```toml
+[dependencies]
+migratio = { version = "0.1", features = ["tracing"] }
+```
+
+When enabled, migrations automatically emit tracing spans and events:
+
+```rust
+use tracing_subscriber;
+
+// Set up tracing subscriber
+tracing_subscriber::fmt::init();
+
+// Migrations will automatically log:
+// INFO migration_up{version=1 name="create_users"}: Starting migration
+// INFO migration_up{version=1 name="create_users"}: Migration completed successfully duration_ms=15
+```
+
 
 License: MIT

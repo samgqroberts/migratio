@@ -21,6 +21,13 @@ sha2 = "0.10"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 thiserror = "2.0.17"
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+tracing-subscriber = "0.3"
+tracing-test = "0.2"
+
+[features]
+default = []
+tracing = ["dep:tracing"]
