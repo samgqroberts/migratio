@@ -60,9 +60,13 @@ assert_eq!(columns, vec!["id", "name", "email"]);
 ## Motivation
 
 Most Rust-based migration solutions focus only on using SQL to define migration logic.
-Even the ones that support writing migrations in Rust use Rust to construct SQL instructions.
-Taking a hint from Alembic, this library allows users to write their migration logic fully in Rust, which allows *querying* live data as part of the migration process.
-SeaORM allows this, but this library aims to provide an alternative for developers that don't want to adopt a full ORM solution.
+Even the ones that say they support writing migrations in Rust use Rust to simply construct SQL instructions, like [Refinery](https://github.com/rust-db/refinery/blob/main/examples/migrations/V3__add_brand_to_cars_table.rs).
+
+Taking a hint from [Alembic](https://alembic.sqlalchemy.org/en/latest/), this library provides the user with a live connection to the database with which to define their migrations.
+With a live connection, a migration can query the data, transform it in Rust, and write it back.
+Migrations defined as pure SQL statements can only accomplish this with the toolkit provided by SQL, which is much more limited.
+
+Note: [SeaORM](https://www.sea-ql.org/SeaORM/) allows this, but `migratio` aims to provide an alternative for developers that don't want to adopt a full ORM solution.
 
 ```rust
 use migratio::{Migration, SqliteMigrator, MigrationReport, Error};
@@ -164,6 +168,7 @@ let rows = stmt
     .collect::<Result<Vec<(String, String)>, _>>()
     .unwrap();
 
+// assert that the data has been transformed
 assert_eq!(
     rows,
     vec![
@@ -214,14 +219,23 @@ let mut conn = Connection::open_in_memory().unwrap();
 let migrator = SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]);
 let report = migrator.upgrade(&mut conn).unwrap();
 
-// Check if any migration failed
-if let Some(failure) = &report.failing_migration {
-    eprintln!("Migration {} ('{}') failed!",
-        failure.migration().version(),
-        failure.migration().name());
-    // Successfully applied: [1]
-    assert_eq!(report.migrations_run, vec![1]);
-}
+// Expect the second migration has failed
+assert!(report.failing_migration.is_some());
+let failure = report.failing_migration.unwrap();
+assert_eq!(failure.migration().version(), 2);
+assert_eq!(failure.migration().name(), "Migration 2");
+assert_eq!(failure.error().to_string(), "near \"INVALID\": syntax error in INVALID SQL at offset 0");
+
+// Expect that the report indicates only the first migration was run
+assert_eq!(report.migrations_run, vec![1]);
+
+// The database is left in the state it was in after the last successful migration (here, version 1)
+assert_eq!(migrator.get_current_version(&mut conn).unwrap(), 1);
+let mut stmt = conn.prepare(
+   "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1"
+).unwrap();
+let count: i64 = stmt.query_row(["users"], |row| row.get(0)).unwrap();
+assert_eq!(count, 1);
 ```
 
 ## Rollback Support
@@ -335,11 +349,12 @@ migrator.upgrade(&mut conn).unwrap();
 
 // Get full migration history
 let history = migrator.get_migration_history(&mut conn).unwrap();
-for migration in &history {
-    println!("Migration {} ({})", migration.version, migration.name);
-    println!("  Applied at: {}", migration.applied_at.to_rfc3339());
-    println!("  Checksum: {}", migration.checksum);
-}
+assert_eq!(history.len(), 1);
+assert_eq!(history[0].version, 1);
+assert_eq!(history[0].name, "create_users_table");
+assert!(!history[0].checksum.is_empty());
+// applied_at is a timestamp, just verify it's parseable
+assert!(history[0].applied_at.to_rfc3339().len() > 0);
 ```
 
 ## Observability Hooks
@@ -349,6 +364,7 @@ Set callbacks to observe migration progress, useful for logging and metrics:
 ```rust
 use migratio::{Migration, SqliteMigrator, Error};
 use rusqlite::{Connection, Transaction};
+use std::sync::{Arc, Mutex};
 
 struct Migration1;
 impl Migration for Migration1 {
@@ -357,21 +373,35 @@ impl Migration for Migration1 {
         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
         Ok(())
     }
+    fn name(&self) -> String {
+        "create_users".to_string()
+    }
 }
 
+let events = Arc::new(Mutex::new(Vec::new()));
+
+let events_clone1 = Arc::clone(&events);
+let events_clone2 = Arc::clone(&events);
+let events_clone3 = Arc::clone(&events);
+
 let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
-    .on_migration_start(|version, name| {
-        println!("Starting migration {} ({})", version, name);
+    .on_migration_start(move |version, name| {
+        events_clone1.lock().unwrap().push(format!("Starting migration {} ({})", version, name));
     })
-    .on_migration_complete(|version, name, duration| {
-        println!("Migration {} ({}) completed in {:?}", version, name, duration);
+    .on_migration_complete(move |version, name, _duration| {
+        events_clone2.lock().unwrap().push(format!("Completed migration {} ({})", version, name));
     })
-    .on_migration_error(|version, name, error| {
-        eprintln!("Migration {} ({}) failed: {:?}", version, name, error);
+    .on_migration_error(move |version, name, error| {
+        events_clone3.lock().unwrap().push(format!("Migration {} ({}) failed: {:?}", version, name, error));
     });
 
 let mut conn = Connection::open_in_memory().unwrap();
 migrator.upgrade(&mut conn).unwrap();
+
+assert_eq!(*events.lock().unwrap(), vec![
+    "Starting migration 1 (create_users)",
+    "Completed migration 1 (create_users)",
+]);
 ```
 
 ## Tracing Integration
@@ -386,14 +416,57 @@ migratio = { version = "0.1", features = ["tracing"] }
 When enabled, migrations automatically emit tracing spans and events:
 
 ```rust
+use migratio::{Migration, SqliteMigrator, Error};
+use rusqlite::{Connection, Transaction};
 use tracing_subscriber;
+use std::sync::{Arc, Mutex};
 
-// Set up tracing subscriber
-tracing_subscriber::fmt::init();
+struct Migration1;
+impl Migration for Migration1 {
+    fn version(&self) -> u32 { 1 }
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+        Ok(())
+    }
+    fn name(&self) -> String {
+        "create_users".to_string()
+    }
+}
 
-// Migrations will automatically log:
-// INFO migration_up{version=1 name="create_users"}: Starting migration
-// INFO migration_up{version=1 name="create_users"}: Migration completed successfully duration_ms=15
+// Capture tracing events for testing
+let events = Arc::new(Mutex::new(Vec::<u8>::new()));
+let events_clone = Arc::clone(&events);
+
+// Set up tracing subscriber without timestamps or colors for reproducible output
+let subscriber = tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::INFO)
+    .without_time()
+    .with_target(false)
+    .with_ansi(false)
+    .with_writer(move || {
+        struct W(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for W {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        W(events_clone.clone())
+    })
+    .finish();
+
+tracing::subscriber::with_default(subscriber, || {
+    let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+    let mut conn = Connection::open_in_memory().unwrap();
+    migrator.upgrade(&mut conn).unwrap();
+});
+
+// Verify the exact captured tracing output
+let output = String::from_utf8(events.lock().unwrap().clone()).unwrap();
+assert_eq!(output, r#" INFO migration_up{version=1 name=create_users}: Starting migration
+ INFO migration_up{version=1 name=create_users}: Migration completed successfully duration_ms=0
+"#);
 ```
 
 ## Migration Testing Utilities
