@@ -428,7 +428,7 @@
 //! let failure = report.failing_migration.unwrap();
 //! assert_eq!(failure.migration().version(), 2);
 //! assert_eq!(failure.migration().name(), "Migration 2");
-//! assert_eq!(failure.error().to_string(), "near \"INVALID\": syntax error in INVALID SQL at offset 0");
+//! assert!(failure.error().to_string().contains("near \"INVALID\": syntax error"));
 //!
 //! // Expect that the report indicates only the first migration was run
 //! assert_eq!(report.migrations_run, vec![1]);

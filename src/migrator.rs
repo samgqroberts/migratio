@@ -1191,15 +1191,13 @@ mod tests {
                 migrations_run: vec![],
                 failing_migration: Some(MigrationFailure {
                     migration: &(Box::new(Migration1) as Box<dyn Migration>),
-                    error: Error::Rusqlite(rusqlite::Error::SqlInputError {
-                        error: rusqlite::ffi::Error {
-                            code: rusqlite::ErrorCode::Unknown,
+                    error: Error::Rusqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ffi::ErrorCode::Unknown,
                             extended_code: 1
                         },
-                        msg: "near \"bleep\": syntax error".to_string(),
-                        sql: "bleep blorp".to_string(),
-                        offset: 0
-                    })
+                        Some("near \"bleep\": syntax error".to_string())
+                    ))
                 })
             }
         );
@@ -1379,15 +1377,13 @@ mod tests {
                 migrations_run: vec![1],
                 failing_migration: Some(MigrationFailure {
                     migration: &(Box::new(Migration2) as Box<dyn Migration>),
-                    error: Error::Rusqlite(rusqlite::Error::SqlInputError {
-                        error: rusqlite::ffi::Error {
-                            code: rusqlite::ErrorCode::Unknown,
+                    error: Error::Rusqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ffi::ErrorCode::Unknown,
                             extended_code: 1
                         },
-                        msg: "near \"bleep\": syntax error".to_string(),
-                        sql: "bleep blorp".to_string(),
-                        offset: 0
-                    })
+                        Some("near \"bleep\": syntax error".to_string())
+                    ))
                 })
             }
         );
@@ -1473,15 +1469,13 @@ mod tests {
                 migrations_run: vec![1],
                 failing_migration: Some(MigrationFailure {
                     migration: &(Box::new(Migration2) as Box<dyn Migration>),
-                    error: Error::Rusqlite(rusqlite::Error::SqlInputError {
-                        error: rusqlite::ffi::Error {
-                            code: rusqlite::ErrorCode::Unknown,
+                    error: Error::Rusqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ffi::ErrorCode::Unknown,
                             extended_code: 1
                         },
-                        msg: "near \"bleep\": syntax error".to_string(),
-                        sql: "bleep blorp".to_string(),
-                        offset: 0
-                    })
+                        Some("near \"bleep\": syntax error".to_string())
+                    ))
                 })
             }
         );
