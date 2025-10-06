@@ -140,7 +140,7 @@ pub trait Migration {
     ///         Ok(())
     ///     }
     ///
-    ///     fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+    ///     fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
     ///         // Check if the table already exists
     ///         let mut stmt = tx.prepare(
     ///             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'"
@@ -155,7 +155,7 @@ pub trait Migration {
     ///     }
     /// }
     /// ```
-    fn precondition(&self, _tx: &Transaction) -> rusqlite::Result<Precondition> {
+    fn precondition(&self, _tx: &Transaction) -> Result<Precondition, Error> {
         Ok(Precondition::NeedsApply)
     }
 }
@@ -756,14 +756,13 @@ impl SqliteMigrator {
                     // Check precondition
                     let precondition = match migration.precondition(&tx) {
                         Ok(p) => p,
-                        Err(e) => {
+                        Err(error) => {
                             #[cfg(feature = "tracing")]
                             tracing::error!(
-                                error = %e,
+                                error = %error,
                                 "Precondition check failed"
                             );
 
-                            let error = Error::Rusqlite(e);
                             // Call on_migration_error hook
                             if let Some(ref callback) = self.on_migration_error {
                                 callback(migration_version, &migration.name(), &error);
@@ -3770,7 +3769,7 @@ mod tests {
                 tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
                 Ok(())
             }
-            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
                 // Check if table already exists
                 let mut stmt = tx.prepare(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
@@ -3836,7 +3835,7 @@ mod tests {
                 tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
                 Ok(())
             }
-            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
                 // Check if table already exists
                 let mut stmt = tx.prepare(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
@@ -3891,9 +3890,9 @@ mod tests {
             fn up(&self, _tx: &Transaction) -> Result<(), Error> {
                 Ok(())
             }
-            fn precondition(&self, _tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, _tx: &Transaction) -> Result<Precondition, Error> {
                 // Simulate a precondition check error
-                Err(rusqlite::Error::InvalidQuery)
+                Err(rusqlite::Error::InvalidQuery.into())
             }
         }
 
@@ -3938,7 +3937,7 @@ mod tests {
                 // This should NOT be called
                 panic!("up() should not be called when precondition is AlreadySatisfied");
             }
-            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
                 // Check if table already exists
                 let mut stmt = tx.prepare(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
@@ -4015,7 +4014,7 @@ mod tests {
                 tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
                 Ok(())
             }
-            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
                 // Check if table already exists
                 let mut stmt = tx.prepare(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
@@ -4097,7 +4096,7 @@ mod tests {
                 tx.execute("CREATE TABLE table1 (id INTEGER PRIMARY KEY)", [])?;
                 Ok(())
             }
-            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
                 let mut stmt = tx.prepare(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='table1'",
                 )?;
@@ -4122,7 +4121,7 @@ mod tests {
                 tx.execute("CREATE TABLE table2 (id INTEGER PRIMARY KEY)", [])?;
                 Ok(())
             }
-            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
                 let mut stmt = tx.prepare(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='table2'",
                 )?;
@@ -4147,7 +4146,7 @@ mod tests {
                 tx.execute("CREATE TABLE table3 (id INTEGER PRIMARY KEY)", [])?;
                 Ok(())
             }
-            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+            fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
                 let mut stmt = tx.prepare(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='table3'",
                 )?;

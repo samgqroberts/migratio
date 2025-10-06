@@ -197,7 +197,7 @@
 //! A central use case for `migratio` is embedding migration logic within an application, usually in the startup procedure.
 //! This way, when the application updates, the next time it starts the database will automatically be migrated to the latest version without any manual intervention.
 //!
-//! Anywhere you can construct the [SqliteMigrator] struct, you can access any feature this library provides.
+//! Anywhere you can construct a [SqliteMigrator] instance, you can access any feature this library provides.
 //!
 //! Consider this terse example of incorporating `migratio` into an application startup procedure:
 //!
@@ -229,6 +229,168 @@
 //! }
 //! ```
 //!
+//! # Adoption
+//!
+//! ## In new projects
+//!
+//! This is the easiest way to get started with `migratio`.
+//! Add it to your `Cargo.toml` file ( `cargo add migratio` ), construct a [SqliteMigrator] instance with some [Migration]s, and call [SqliteMigrator::upgrade] wherever you want migrations to be considered.
+//!
+//! ## In projects currently executing manual database setup on app run
+//!
+//! In this case, your app has some consideration on app startup (or whenever you initialize a connection to the database) that looks like this, which relies on an idempotent procedure to initialize the database's schema:
+//!
+//! ```
+//! # use rusqlite::Connection;
+//! fn get_conn(db_path: &str) -> Result<Connection, String> {
+//!     let conn = Connection::open(db_path)
+//!         .map_err(|e| format!("Failed to open database: {}", e))?;
+//!
+//!     conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)", [])
+//!         .map_err(|e| format!("Failed to create users table: {}", e))?;
+//!
+//!     conn.execute(
+//!         "CREATE TABLE IF NOT EXISTS preferences (
+//!             user_id INTEGER NOT NULL,
+//!             preferences TEXT NOT NULL
+//!         )",
+//!         [],
+//!     ).map_err(|e| format!("Failed to create preferences table: {}", e))?;
+//!
+//!     Ok(conn)
+//! }
+//! ```
+//!
+//! You rely on the idempotence of this setup code to be able to run it multiple times without causing any issues.
+//! In this case, this logic can be the first migration in your project:
+//!
+//! ```
+//! # use migratio::{SqliteMigrator, Migration, Error};
+//! # use rusqlite::{Connection, Transaction};
+//! struct Migration1;
+//! impl Migration for Migration1 {
+//!     fn version(&self) -> u32 {
+//!         1
+//!     }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)", [])?;
+//!
+//!         tx.execute(
+//!             "CREATE TABLE IF NOT EXISTS preferences (
+//!                 user_id INTEGER NOT NULL,
+//!                 preferences TEXT NOT NULL
+//!             )",
+//!             [],
+//!         )?;
+//!
+//!         Ok(())
+//!     }
+//! }
+//!
+//! // Then replace your existing setup code with:
+//! fn get_conn(db_path: &str) -> Result<Connection, String> {
+//!     let mut conn = Connection::open(db_path)
+//!         .map_err(|e| format!("Failed to open database: {}", e))?;
+//!
+//!     let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+//!     migrator.upgrade(&mut conn)
+//!         .map_err(|e| format!("Migration failed: {}", e))?;
+//!
+//!     Ok(conn)
+//! }
+//! ```
+//!
+//! This relies on the same idempotence the original code relied on.
+//! From here, you can add new [Migration]s (which do not have to be idempotent) to the [SqliteMigrator] that ship in future app updates.
+//! Note that this migration consideration can (and maybe should) be moved somewhere that only runs once on app startup.
+//!
+//! ## In projects currently using another migration tool
+//!
+//! Let's say you have another migration tool, with two existing migrations:
+//! 1. Create users table
+//! 2. Create preferences table
+//!
+//! You may have deployments whose databases:
+//! - Have never been initialized (have applied neither of these migrations)
+//! - Have applied only Migration 1
+//! - Have applied Migration 1 and 2
+//!
+//! One approach, similar to the previous section, is to ensure the migration logic is idempotent when you translate it from the old tool to `migratio`.
+//! Even if you have `CREATE TABLE` statements in the old tool, you can translate them to `CREATE TABLE IF NOT EXISTS` in the `migratio` migrations.
+//! The idempotence will ensure that in each of the 3 initial states the database could be in, it will be brought to the desired state.
+//!
+//! Another approach is to use the [Migration::precondition] method to check if the migration should be applied again.
+//!
+//! ```
+//! # use migratio::{Migration, Precondition, Error};
+//! # use rusqlite::{Transaction};
+//! struct CreateUsersTable;
+//! impl Migration for CreateUsersTable {
+//!     fn version(&self) -> u32 {
+//!         1
+//!     }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         // logic copied / translated from the other migration tool usage
+//!         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)", [])?;
+//!         Ok(())
+//!     }
+//!     fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
+//!         let mut stmt = tx.prepare(
+//!             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+//!         )?;
+//!         let count: i64 = stmt.query_row([], |row| row.get(0))?;
+//!         Ok(if count == 0 { Precondition::NeedsApply } else { Precondition::AlreadySatisfied })
+//!     }
+//! }
+//!
+//! struct CreatePreferencesTable;
+//! impl Migration for CreatePreferencesTable {
+//!     fn version(&self) -> u32 {
+//!         2
+//!     }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         // logic copied / translated from the other migration tool usage
+//!         tx.execute(
+//!             "CREATE TABLE IF NOT EXISTS preferences (
+//!                 user_id INTEGER NOT NULL,
+//!                 preferences TEXT NOT NULL
+//!             )",
+//!             [],
+//!         )?;
+//!         Ok(())
+//!     }
+//!     fn precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
+//!         let mut stmt = tx.prepare(
+//!             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='preferences'",
+//!         )?;
+//!         let count: i64 = stmt.query_row([], |row| row.get(0))?;
+//!         Ok(if count == 0 { Precondition::NeedsApply } else { Precondition::AlreadySatisfied })
+//!     }
+//! }
+//! ```
+//!
+//! When the precondition returns `Precondition::AlreadySatisfied`, the migration up() logic will not be run, but the migration will still be recorded as applied.
+//!
+//! This way, in each of the possible cases, the database will be brought to the desired state.
+//! - No migrations yet run -> both migration preconditions will return `Precondition::NeedsApply` and will be run.
+//! - Migration 1 already applied -> `CreateUsersTable.precondition()` will return `Precondition::AlreadySatisfied`, but `CreatePreferencesTable.precondition()` will return `Precondition::NeedsApply`, and that will be run.
+//! - Migration 1 and 2 already applied -> both migration preconditions will return `Precondition::AlreadySatisfied`, and neither migration up() logic will be run.
+//!
+//! Note: the old migration library will have used its own table to track migrations. You may want to add a new migration at this point to clean up that migration table.
+//!
+//! ```
+//! # use migratio::{Migration, Error};
+//! # use rusqlite::Transaction;
+//! // in this case, old migration library was alembic
+//! struct CleanupAlembicTrackingTable;
+//! impl Migration for CleanupAlembicTrackingTable {
+//!     fn version(&self) -> u32 { 3 }
+//!     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+//!         tx.execute("DROP TABLE IF EXISTS alembic_version", [])?;
+//!         Ok(())
+//!     }
+//! }
+//! ```
 //!
 //! # Error Handling
 //!
