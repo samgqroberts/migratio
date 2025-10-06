@@ -2,6 +2,10 @@
 
 `migratio` is a lightweight library for managing database migrations (currently for Sqlite).
 
+Core concepts:
+- `migratio` supplies migration definitions with a live connection to the database, allowing more expressive migration logic than just preparing SQL statements.
+- `migratio` is a code-first library, making embedding it in your application easier than other CLI-first libraries.
+
 ## Example
 
 ```rust
@@ -58,6 +62,8 @@ assert_eq!(columns, vec!["id", "name", "email"]);
 ```
 
 ## Motivation
+
+### Using a Live Database Connection
 
 Most Rust-based migration solutions focus only on using SQL to define migration logic.
 Even the ones that say they support writing migrations in Rust use Rust to simply construct SQL instructions, like [Refinery](https://github.com/rust-db/refinery/blob/main/examples/migrations/V3__add_brand_to_cars_table.rs).
@@ -187,6 +193,42 @@ assert_eq!(
     ]
 );
 ```
+
+### Code-first approach
+
+A central use case for `migratio` is embedding migration logic within an application, usually in the startup procedure.
+This way, when the application updates, the next time it starts the database will automatically be migrated to the latest version without any manual intervention.
+
+Anywhere you can construct the [SqliteMigrator] struct, you can access any feature this library provides.
+
+Consider this terse example of incorporating `migratio` into an application startup procedure:
+
+```rust
+// migrations.rs
+
+struct Migration1;
+impl Migration for Migration1 {
+    fn version(&self) -> u32 { 1 }
+    fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
+        Ok(())
+    }
+}
+
+pub fn migrator() -> SqliteMigrator {
+    SqliteMigrator::new(vec![Box::new(Migration1)])
+}
+
+// main.rs
+
+fn main() {
+    let mut conn = Connection::open_in_memory().expect("Failed to open database"); // or, rather, where your database is located
+    migrator().upgrade(&mut conn).expect("Migration failed");
+
+    // ... rest of app startup
+}
+```
+
 
 ## Error Handling
 

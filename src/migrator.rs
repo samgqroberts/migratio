@@ -32,6 +32,15 @@ pub struct MigrationReport<'migration> {
     pub failing_migration: Option<MigrationFailure<'migration>>,
 }
 
+/// Represents the result of a migration precondition check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Precondition {
+    /// The migration's changes are already present in the database and should be stamped without running up().
+    AlreadySatisfied,
+    /// The migration needs to be applied by running up().
+    NeedsApply,
+}
+
 /// Represents a migration that has been applied to the database.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppliedMigration {
@@ -103,6 +112,52 @@ pub trait Migration {
     fn description(&self) -> Option<&'static str> {
         None
     }
+
+    /// Optional precondition check for the migration.
+    ///
+    /// This method is called before running the migration's `up()` method during upgrade.
+    /// It allows the migration to check if its changes are already present in the database
+    /// (for example, when adopting migratio after using another migration tool).
+    ///
+    /// If this returns `Precondition::AlreadySatisfied`, the migration is stamped as applied
+    /// in the version table without running `up()`. If it returns `Precondition::NeedsApply`,
+    /// the migration runs normally via `up()`.
+    ///
+    /// The default implementation returns `Precondition::NeedsApply`, meaning migrations
+    /// always run unless you override this method.
+    ///
+    /// # Example
+    /// ```
+    /// use migratio::{Migration, Precondition, Error};
+    /// use rusqlite::Transaction;
+    ///
+    /// struct Migration1;
+    /// impl Migration for Migration1 {
+    ///     fn version(&self) -> u32 { 1 }
+    ///
+    ///     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+    ///         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+    ///         // Check if the table already exists
+    ///         let mut stmt = tx.prepare(
+    ///             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'"
+    ///         )?;
+    ///         let count: i64 = stmt.query_row([], |row| row.get(0))?;
+    ///
+    ///         if count > 0 {
+    ///             Ok(Precondition::AlreadySatisfied)
+    ///         } else {
+    ///             Ok(Precondition::NeedsApply)
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    fn precondition(&self, _tx: &Transaction) -> rusqlite::Result<Precondition> {
+        Ok(Precondition::NeedsApply)
+    }
 }
 
 impl PartialEq for dyn Migration {
@@ -129,6 +184,7 @@ pub struct SqliteMigrator {
     busy_timeout: std::time::Duration,
     on_migration_start: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
     on_migration_complete: Option<Box<dyn Fn(u32, &str, std::time::Duration) + Send + Sync>>,
+    on_migration_skipped: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
     on_migration_error: Option<Box<dyn Fn(u32, &str, &Error) + Send + Sync>>,
 }
 
@@ -144,6 +200,7 @@ impl std::fmt::Debug for SqliteMigrator {
                 "on_migration_complete",
                 &self.on_migration_complete.is_some(),
             )
+            .field("on_migration_skipped", &self.on_migration_skipped.is_some())
             .field("on_migration_error", &self.on_migration_error.is_some())
             .finish()
     }
@@ -215,6 +272,7 @@ impl SqliteMigrator {
             busy_timeout: std::time::Duration::from_secs(30),
             on_migration_start: None,
             on_migration_complete: None,
+            on_migration_skipped: None,
             on_migration_error: None,
         })
     }
@@ -296,6 +354,35 @@ impl SqliteMigrator {
         F: Fn(u32, &str, std::time::Duration) + Send + Sync + 'static,
     {
         self.on_migration_complete = Some(Box::new(callback));
+        self
+    }
+
+    /// Set a callback to be invoked when a migration is skipped because its precondition
+    /// returned `Precondition::AlreadySatisfied`.
+    /// The callback receives the migration version and name.
+    ///
+    /// # Example
+    /// ```
+    /// use migratio::SqliteMigrator;
+    /// # use migratio::Migration;
+    /// # use rusqlite::Transaction;
+    /// # use migratio::Error;
+    ///
+    /// # struct Migration1;
+    /// # impl Migration for Migration1 {
+    /// #     fn version(&self) -> u32 { 1 }
+    /// #     fn up(&self, tx: &Transaction) -> Result<(), Error> { Ok(()) }
+    /// # }
+    /// let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+    ///     .on_migration_skipped(|version, name| {
+    ///         println!("Migration {} ({}) skipped - already satisfied", version, name);
+    ///     });
+    /// ```
+    pub fn on_migration_skipped<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(u32, &str) + Send + Sync + 'static,
+    {
+        self.on_migration_skipped = Some(Box::new(callback));
         self
     }
 
@@ -660,15 +747,61 @@ impl SqliteMigrator {
 
                 let migration_start = Instant::now();
 
-                // Start a transaction for this migration
-                let tx = conn.transaction()?;
-                let migration_result = migration.up(&tx);
+                // Run migration or stamp if precondition is satisfied
+                // We wrap this in a block to ensure the transaction is dropped before we use conn
+                let migration_result = {
+                    // Start a transaction for this migration
+                    let tx = conn.transaction()?;
+
+                    // Check precondition
+                    let precondition = match migration.precondition(&tx) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!(
+                                error = %e,
+                                "Precondition check failed"
+                            );
+
+                            let error = Error::Rusqlite(e);
+                            // Call on_migration_error hook
+                            if let Some(ref callback) = self.on_migration_error {
+                                callback(migration_version, &migration.name(), &error);
+                            }
+
+                            // Transaction will be automatically rolled back when dropped
+                            failing_migration = Some(MigrationFailure { migration, error });
+                            break;
+                        }
+                    };
+
+                    match precondition {
+                        Precondition::AlreadySatisfied => {
+                            #[cfg(feature = "tracing")]
+                            tracing::info!("Precondition already satisfied, stamping migration without running up()");
+
+                            // Call on_migration_skipped hook
+                            if let Some(ref callback) = self.on_migration_skipped {
+                                callback(migration_version, &migration.name());
+                            }
+
+                            // Commit the transaction (even though we didn't run up())
+                            tx.commit()?;
+                            Ok(())
+                        }
+                        Precondition::NeedsApply => {
+                            let result = migration.up(&tx);
+                            if result.is_ok() {
+                                // Commit the transaction
+                                tx.commit()?;
+                            }
+                            result
+                        }
+                    }
+                };
 
                 match migration_result {
                     Ok(_) => {
-                        // Commit the transaction
-                        tx.commit()?;
-
                         let migration_duration = migration_start.elapsed();
 
                         #[cfg(feature = "tracing")]
@@ -3608,5 +3741,459 @@ mod tests {
         }
 
         run_test();
+    }
+
+    #[test]
+    fn precondition_already_satisfied() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Create table manually (simulating existing migration from another tool)
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+
+        // Track whether up() was called
+        let up_called = Arc::new(Mutex::new(false));
+        let up_called_clone = Arc::clone(&up_called);
+
+        struct Migration1 {
+            up_called: Arc<Mutex<bool>>,
+        }
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                // Mark that up() was called
+                *self.up_called.lock().unwrap() = true;
+                tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+                // Check if table already exists
+                let mut stmt = tx.prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+
+                if count > 0 {
+                    Ok(Precondition::AlreadySatisfied)
+                } else {
+                    Ok(Precondition::NeedsApply)
+                }
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1 {
+            up_called: up_called_clone,
+        })]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Verify migration was recorded as run
+        assert_eq!(report.migrations_run, vec![1]);
+        assert!(report.failing_migration.is_none());
+
+        // Verify up() was NOT called
+        assert!(!*up_called.lock().unwrap());
+
+        // Verify migration is in version table
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 1);
+
+        // Verify table still exists (wasn't modified)
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1);
+    }
+
+    #[test]
+    fn precondition_needs_apply() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Track whether up() was called
+        let up_called = Arc::new(Mutex::new(false));
+        let up_called_clone = Arc::clone(&up_called);
+
+        struct Migration1 {
+            up_called: Arc<Mutex<bool>>,
+        }
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                // Mark that up() was called
+                *self.up_called.lock().unwrap() = true;
+                tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+                // Check if table already exists
+                let mut stmt = tx.prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+
+                if count > 0 {
+                    Ok(Precondition::AlreadySatisfied)
+                } else {
+                    Ok(Precondition::NeedsApply)
+                }
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1 {
+            up_called: up_called_clone,
+        })]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Verify migration was recorded as run
+        assert_eq!(report.migrations_run, vec![1]);
+        assert!(report.failing_migration.is_none());
+
+        // Verify up() WAS called
+        assert!(*up_called.lock().unwrap());
+
+        // Verify migration is in version table
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 1);
+
+        // Verify table was created
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1);
+    }
+
+    #[test]
+    fn precondition_error() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+            fn precondition(&self, _tx: &Transaction) -> rusqlite::Result<Precondition> {
+                // Simulate a precondition check error
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Verify migration failed
+        assert_eq!(report.migrations_run, vec![]);
+        assert!(report.failing_migration.is_some());
+
+        let failure = report.failing_migration.unwrap();
+        assert_eq!(failure.migration().version(), 1);
+
+        // Verify migration is NOT in version table
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn precondition_hooks_already_satisfied() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Create table manually (simulating existing migration from another tool)
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+
+        // Track hook calls
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone1 = Arc::clone(&events);
+        let events_clone2 = Arc::clone(&events);
+        let events_clone3 = Arc::clone(&events);
+        let events_clone4 = Arc::clone(&events);
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, _tx: &Transaction) -> Result<(), Error> {
+                // This should NOT be called
+                panic!("up() should not be called when precondition is AlreadySatisfied");
+            }
+            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+                // Check if table already exists
+                let mut stmt = tx.prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+
+                if count > 0 {
+                    Ok(Precondition::AlreadySatisfied)
+                } else {
+                    Ok(Precondition::NeedsApply)
+                }
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+            .on_migration_start(move |version, name| {
+                events_clone1
+                    .lock()
+                    .unwrap()
+                    .push(format!("start:{}:{}", version, name));
+            })
+            .on_migration_skipped(move |version, name| {
+                events_clone2
+                    .lock()
+                    .unwrap()
+                    .push(format!("skipped:{}:{}", version, name));
+            })
+            .on_migration_complete(move |version, name, _duration| {
+                events_clone3
+                    .lock()
+                    .unwrap()
+                    .push(format!("complete:{}:{}", version, name));
+            })
+            .on_migration_error(move |version, name, _error| {
+                events_clone4
+                    .lock()
+                    .unwrap()
+                    .push(format!("error:{}:{}", version, name));
+            });
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Verify migration was recorded
+        assert_eq!(report.migrations_run, vec![1]);
+        assert!(report.failing_migration.is_none());
+
+        // Verify hooks were called correctly
+        let events_vec = events.lock().unwrap();
+        assert_eq!(events_vec.len(), 3);
+        assert_eq!(events_vec[0], "start:1:Migration 1");
+        assert_eq!(events_vec[1], "skipped:1:Migration 1");
+        assert_eq!(events_vec[2], "complete:1:Migration 1");
+    }
+
+    #[test]
+    fn precondition_hooks_needs_apply() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Track hook calls
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone1 = Arc::clone(&events);
+        let events_clone2 = Arc::clone(&events);
+        let events_clone3 = Arc::clone(&events);
+        let events_clone4 = Arc::clone(&events);
+
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+                // Check if table already exists
+                let mut stmt = tx.prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+
+                if count > 0 {
+                    Ok(Precondition::AlreadySatisfied)
+                } else {
+                    Ok(Precondition::NeedsApply)
+                }
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(Migration1)])
+            .on_migration_start(move |version, name| {
+                events_clone1
+                    .lock()
+                    .unwrap()
+                    .push(format!("start:{}:{}", version, name));
+            })
+            .on_migration_skipped(move |version, name| {
+                events_clone2
+                    .lock()
+                    .unwrap()
+                    .push(format!("skipped:{}:{}", version, name));
+            })
+            .on_migration_complete(move |version, name, _duration| {
+                events_clone3
+                    .lock()
+                    .unwrap()
+                    .push(format!("complete:{}:{}", version, name));
+            })
+            .on_migration_error(move |version, name, _error| {
+                events_clone4
+                    .lock()
+                    .unwrap()
+                    .push(format!("error:{}:{}", version, name));
+            });
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Verify migration was recorded
+        assert_eq!(report.migrations_run, vec![1]);
+        assert!(report.failing_migration.is_none());
+
+        // Verify hooks were called correctly (no skipped hook)
+        let events_vec = events.lock().unwrap();
+        assert_eq!(events_vec.len(), 2);
+        assert_eq!(events_vec[0], "start:1:Migration 1");
+        assert_eq!(events_vec[1], "complete:1:Migration 1");
+    }
+
+    #[test]
+    fn precondition_mixed_migrations() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Create one table manually (simulating partial migration state)
+        conn.execute("CREATE TABLE table1 (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+
+        // Track which migrations had up() called
+        let up_calls = Arc::new(Mutex::new(Vec::new()));
+        let up_calls_clone1 = Arc::clone(&up_calls);
+        let up_calls_clone2 = Arc::clone(&up_calls);
+        let up_calls_clone3 = Arc::clone(&up_calls);
+
+        struct Migration1 {
+            up_calls: Arc<Mutex<Vec<u32>>>,
+        }
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                self.up_calls.lock().unwrap().push(1);
+                tx.execute("CREATE TABLE table1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+                let mut stmt = tx.prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='table1'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+                Ok(if count > 0 {
+                    Precondition::AlreadySatisfied
+                } else {
+                    Precondition::NeedsApply
+                })
+            }
+        }
+
+        struct Migration2 {
+            up_calls: Arc<Mutex<Vec<u32>>>,
+        }
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                self.up_calls.lock().unwrap().push(2);
+                tx.execute("CREATE TABLE table2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+                let mut stmt = tx.prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='table2'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+                Ok(if count > 0 {
+                    Precondition::AlreadySatisfied
+                } else {
+                    Precondition::NeedsApply
+                })
+            }
+        }
+
+        struct Migration3 {
+            up_calls: Arc<Mutex<Vec<u32>>>,
+        }
+        impl Migration for Migration3 {
+            fn version(&self) -> u32 {
+                3
+            }
+            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+                self.up_calls.lock().unwrap().push(3);
+                tx.execute("CREATE TABLE table3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn precondition(&self, tx: &Transaction) -> rusqlite::Result<Precondition> {
+                let mut stmt = tx.prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='table3'",
+                )?;
+                let count: i64 = stmt.query_row([], |row| row.get(0))?;
+                Ok(if count > 0 {
+                    Precondition::AlreadySatisfied
+                } else {
+                    Precondition::NeedsApply
+                })
+            }
+        }
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(Migration1 {
+                up_calls: up_calls_clone1,
+            }),
+            Box::new(Migration2 {
+                up_calls: up_calls_clone2,
+            }),
+            Box::new(Migration3 {
+                up_calls: up_calls_clone3,
+            }),
+        ]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+
+        // Verify all migrations were recorded
+        assert_eq!(report.migrations_run, vec![1, 2, 3]);
+        assert!(report.failing_migration.is_none());
+
+        // Verify only migrations 2 and 3 had up() called (migration 1 was skipped)
+        let calls = up_calls.lock().unwrap();
+        assert_eq!(*calls, vec![2, 3]);
+
+        // Verify all tables exist
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('table1', 'table2', 'table3')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 3);
+
+        // Verify all migrations are in version table
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 3);
     }
 }
