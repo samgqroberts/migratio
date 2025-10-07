@@ -61,12 +61,8 @@ pub struct SchemaSnapshot {
 }
 
 /// Represents a table's schema.
-/// TODO remove sql from this. if one (manual) setup script constructed the table with newlines
-/// vs the migration script without newlines, this equality check would fail, but that should not matter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableSchema {
-    /// SQL CREATE statement for the table
-    pub sql: String,
     /// List of columns
     pub columns: Vec<ColumnInfo>,
     /// List of indexes
@@ -316,42 +312,89 @@ impl MigrationTestHarness {
             .collect::<Result<Vec<_>, _>>()?;
 
         for table_name in table_names {
-            let sql: String = self.conn.query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
-                [&table_name],
-                |row| row.get(0),
-            )?;
-
-            // Normalize SQL to avoid quoting differences
-            let normalized_sql = sql.replace("\"", "");
-
             let columns = self.get_columns(&table_name)?;
             let indexes = self.get_indexes(&table_name)?;
 
-            tables.insert(
-                table_name,
-                TableSchema {
-                    sql: normalized_sql,
-                    columns,
-                    indexes,
-                },
-            );
+            tables.insert(table_name, TableSchema { columns, indexes });
         }
 
         Ok(SchemaSnapshot { tables })
     }
 
     /// Assert that the current schema matches a previously captured snapshot.
-    /// TODO this should provide much better error message than the broad debug left != right default
     pub fn assert_schema_matches(&mut self, expected: &SchemaSnapshot) -> Result<(), Error> {
         let actual = self.capture_schema()?;
 
         if actual != *expected {
+            let mut differences = Vec::new();
+
+            // Sort table names for deterministic ordering
+            let mut expected_table_names: Vec<_> = expected.tables.keys().collect();
+            expected_table_names.sort();
+            let mut actual_table_names: Vec<_> = actual.tables.keys().collect();
+            actual_table_names.sort();
+
+            // Check for tables in expected but not in actual
+            for table_name in &expected_table_names {
+                if !actual.tables.contains_key(*table_name) {
+                    differences.push(format!("  - Table '{}' is missing", table_name));
+                }
+            }
+
+            // Check for tables in actual but not in expected
+            for table_name in &actual_table_names {
+                if !expected.tables.contains_key(*table_name) {
+                    differences.push(format!("  - Unexpected table '{}' found", table_name));
+                }
+            }
+
+            // Check for differences in common tables (sorted order)
+            for table_name in &expected_table_names {
+                let expected_table = &expected.tables[*table_name];
+                if let Some(actual_table) = actual.tables.get(*table_name) {
+                    // Check column differences
+                    if expected_table.columns != actual_table.columns {
+                        let expected_cols: Vec<_> =
+                            expected_table.columns.iter().map(|c| &c.name).collect();
+                        let actual_cols: Vec<_> =
+                            actual_table.columns.iter().map(|c| &c.name).collect();
+
+                        if expected_cols != actual_cols {
+                            differences.push(format!(
+                                "  - Table '{}' column mismatch:\n    Expected columns: {:?}\n    Actual columns:   {:?}",
+                                table_name, expected_cols, actual_cols
+                            ));
+                        } else {
+                            // Same column names but different properties
+                            for (expected_col, actual_col) in
+                                expected_table.columns.iter().zip(&actual_table.columns)
+                            {
+                                if expected_col != actual_col {
+                                    differences.push(format!(
+                                        "  - Table '{}' column '{}' properties differ:\n    Expected: {:?}\n    Actual:   {:?}",
+                                        table_name, expected_col.name, expected_col, actual_col
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // Check index differences
+                    if expected_table.indexes != actual_table.indexes {
+                        let expected_idxs: Vec<_> =
+                            expected_table.indexes.iter().map(|i| &i.name).collect();
+                        let actual_idxs: Vec<_> =
+                            actual_table.indexes.iter().map(|i| &i.name).collect();
+                        differences.push(format!(
+                            "  - Table '{}' index mismatch:\n    Expected indexes: {:?}\n    Actual indexes:   {:?}",
+                            table_name, expected_idxs, actual_idxs
+                        ));
+                    }
+                }
+            }
+
             return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                format!(
-                    "Schema mismatch.\nExpected: {:#?}\nActual: {:#?}",
-                    expected, actual
-                ),
+                format!("Schema mismatch detected:\n{}", differences.join("\n")),
             )));
         }
 
@@ -380,19 +423,21 @@ impl MigrationTestHarness {
 
     /// Get index information for a table.
     fn get_indexes(&mut self, table_name: &str) -> Result<Vec<IndexInfo>, Error> {
+        // Get all indexes for this table
         let mut stmt = self.conn.prepare(
-            "SELECT name, \"unique\", sql FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL"
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL"
         )?;
 
-        let indexes = stmt
-            .query_map([table_name], |row| {
-                Ok(IndexInfo {
-                    name: row.get(0)?,
-                    unique: row.get::<_, i32>(1)? != 0,
-                    sql: row.get(2)?,
-                })
-            })?
+        let index_names_and_sql: Vec<(String, String)> = stmt
+            .query_map([table_name], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
+
+        let mut indexes = Vec::new();
+        for (name, sql) in index_names_and_sql {
+            // Determine if unique by checking the SQL statement
+            let unique = sql.to_uppercase().contains("UNIQUE");
+            indexes.push(IndexInfo { name, unique, sql });
+        }
 
         Ok(indexes)
     }
@@ -687,6 +732,153 @@ mod tests {
             .unwrap();
         let result = harness.assert_schema_matches(&snapshot);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_assert_schema_matches_error_missing_table() {
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+
+        harness.migrate_to(1).unwrap();
+        let snapshot = harness.capture_schema().unwrap();
+
+        // Drop the table
+        harness.execute("DROP TABLE users").unwrap();
+
+        let result = harness.assert_schema_matches(&snapshot);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = match err {
+            Error::Rusqlite(rusqlite::Error::InvalidParameterName(msg)) => msg,
+            _ => panic!("Expected InvalidParameterName error"),
+        };
+        assert_eq!(
+            err_msg,
+            r#"Schema mismatch detected:
+  - Table 'users' is missing"#
+        );
+    }
+
+    #[test]
+    fn test_assert_schema_matches_error_unexpected_table() {
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+
+        harness.migrate_to(1).unwrap();
+        let snapshot = harness.capture_schema().unwrap();
+
+        // Add an unexpected table
+        harness
+            .execute("CREATE TABLE posts (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let result = harness.assert_schema_matches(&snapshot);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = match err {
+            Error::Rusqlite(rusqlite::Error::InvalidParameterName(msg)) => msg,
+            _ => panic!("Expected InvalidParameterName error"),
+        };
+        assert_eq!(
+            err_msg,
+            r#"Schema mismatch detected:
+  - Unexpected table 'posts' found"#
+        );
+    }
+
+    #[test]
+    fn test_assert_schema_matches_error_column_added() {
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+
+        harness.migrate_to(1).unwrap();
+        let snapshot = harness.capture_schema().unwrap();
+
+        // Add a column
+        harness
+            .execute("ALTER TABLE users ADD COLUMN age INTEGER")
+            .unwrap();
+
+        let result = harness.assert_schema_matches(&snapshot);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = match err {
+            Error::Rusqlite(rusqlite::Error::InvalidParameterName(msg)) => msg,
+            _ => panic!("Expected InvalidParameterName error"),
+        };
+        assert_eq!(
+            err_msg,
+            r#"Schema mismatch detected:
+  - Table 'users' column mismatch:
+    Expected columns: ["id", "name"]
+    Actual columns:   ["id", "name", "age"]"#
+        );
+    }
+
+    #[test]
+    fn test_assert_schema_matches_error_index_mismatch() {
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
+
+        harness.migrate_to(2).unwrap();
+        let snapshot = harness.capture_schema().unwrap();
+
+        // Add an index
+        harness
+            .execute("CREATE INDEX idx_users_name ON users(name)")
+            .unwrap();
+
+        let result = harness.assert_schema_matches(&snapshot);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = match err {
+            Error::Rusqlite(rusqlite::Error::InvalidParameterName(msg)) => msg,
+            other => panic!("Expected InvalidParameterName error, got: {:?}", other),
+        };
+        assert_eq!(
+            err_msg,
+            r#"Schema mismatch detected:
+  - Table 'users' index mismatch:
+    Expected indexes: []
+    Actual indexes:   ["idx_users_name"]"#
+        );
+    }
+
+    #[test]
+    fn test_assert_schema_matches_error_multiple_differences() {
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
+
+        harness.migrate_to(2).unwrap();
+        let snapshot = harness.capture_schema().unwrap();
+
+        // Make multiple changes
+        harness
+            .execute("ALTER TABLE users ADD COLUMN age INTEGER")
+            .unwrap();
+        harness
+            .execute("CREATE TABLE posts (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let result = harness.assert_schema_matches(&snapshot);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = match err {
+            Error::Rusqlite(rusqlite::Error::InvalidParameterName(msg)) => msg,
+            _ => panic!("Expected InvalidParameterName error"),
+        };
+        assert_eq!(
+            err_msg,
+            r#"Schema mismatch detected:
+  - Unexpected table 'posts' found
+  - Table 'users' column mismatch:
+    Expected columns: ["id", "name", "email"]
+    Actual columns:   ["id", "name", "email", "age"]"#
+        );
     }
 
     #[test]
