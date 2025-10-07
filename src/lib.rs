@@ -697,7 +697,7 @@
 //! # #[cfg(feature = "testing")]
 //! # fn main() {
 //! use migratio::testing::MigrationTestHarness;
-//! use migratio::{Migration, Error};
+//! use migratio::{Migration, SqliteMigrator, Error};
 //! use rusqlite::Transaction;
 //!
 //! struct Migration1;
@@ -715,7 +715,7 @@
 //!
 //! // in legitimate cases, this function would be a #[test]
 //! fn test_migration_1() {
-//!     let mut harness = MigrationTestHarness::new(vec![Box::new(Migration1)]);
+//!     let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1)]));
 //!
 //!     // Migrate to version 1
 //!     harness.migrate_to(1).unwrap();
@@ -805,7 +805,7 @@
 //!
 //! // in legitimate cases, this function would be a #[test]
 //! fn test_data_transformation_migration() {
-//!     let mut harness = MigrationTestHarness::new(vec![Box::new(Migration1), Box::new(Migration2)]);
+//!     let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]));
 //!
 //!     // Set up test data in old format
 //!     harness.migrate_to(1).unwrap();

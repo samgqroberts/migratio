@@ -3,7 +3,7 @@
 //! This module provides a test harness for writing comprehensive migration tests,
 //! including data transformation tests, schema validation, and reversibility checks.
 
-use crate::{Error, Migration, SqliteMigrator};
+use crate::{Error, SqliteMigrator};
 use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 ///
 /// ```
 /// use migratio::testing::MigrationTestHarness;
-/// use migratio::{Migration, Error};
+/// use migratio::{Migration, SqliteMigrator, Error};
 /// use rusqlite::Transaction;
 ///
 /// struct Migration1;
@@ -31,7 +31,7 @@ use std::collections::HashMap;
 /// }
 ///
 /// # fn test() -> Result<(), Error> {
-/// let mut harness = MigrationTestHarness::new(vec![Box::new(Migration1)]);
+/// let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1)]));
 ///
 /// // Migrate to version 1
 /// harness.migrate_to(1)?;
@@ -61,6 +61,8 @@ pub struct SchemaSnapshot {
 }
 
 /// Represents a table's schema.
+/// TODO remove sql from this. if one (manual) setup script constructed the table with newlines
+/// vs the migration script without newlines, this equality check would fail, but that should not matter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableSchema {
     /// SQL CREATE statement for the table
@@ -90,19 +92,36 @@ pub struct IndexInfo {
 }
 
 impl MigrationTestHarness {
-    /// Create a new test harness with the given migrations.
+    /// Create a new test harness with the given migrator.
+    /// This should be the same migrator that is used in the production environment:
+    /// as it changes, asserts on previous migrations SHOULD NOT CHANGE.
+    ///
+    /// It is recommended to have a function somewhere that constructs the migrator, eg:
+    /// ```ignore
+    /// fn migrator() -> SqliteMigrator {
+    ///     SqliteMigrator::new(vec![
+    ///         Box::new(Migration1),
+    ///         Box::new(Migration2),
+    ///     ])
+    /// }
+    /// ```
+    ///
+    /// and then in each test, construct the harness like:
+    /// ```ignore
+    /// let harness = MigrationTestHarness::new(migrator());
+    /// ```
+    ///
     /// Uses an in-memory SQLite database by default.
-    pub fn new(migrations: Vec<Box<dyn Migration>>) -> Self {
+    pub fn new(migrator: SqliteMigrator) -> Self {
         let conn = Connection::open_in_memory().expect("Failed to create in-memory test database");
-        let migrator = SqliteMigrator::new(migrations);
-
         Self { conn, migrator }
     }
 
     /// Create a test harness with a custom connection.
     /// Useful for testing with file-based databases or custom settings.
-    pub fn with_connection(conn: Connection, migrations: Vec<Box<dyn Migration>>) -> Self {
-        let migrator = SqliteMigrator::new(migrations);
+    ///
+    /// See [MigrationTestHarness::new] for more information.
+    pub fn with_connection(conn: Connection, migrator: SqliteMigrator) -> Self {
         Self { conn, migrator }
     }
 
@@ -323,6 +342,7 @@ impl MigrationTestHarness {
     }
 
     /// Assert that the current schema matches a previously captured snapshot.
+    /// TODO this should provide much better error message than the broad debug left != right default
     pub fn assert_schema_matches(&mut self, expected: &SchemaSnapshot) -> Result<(), Error> {
         let actual = self.capture_schema()?;
 
@@ -385,6 +405,8 @@ impl MigrationTestHarness {
 
 #[cfg(test)]
 mod tests {
+    use crate::Migration;
+
     use super::*;
     use rusqlite::Transaction;
 
@@ -450,11 +472,11 @@ mod tests {
 
     #[test]
     fn test_migrate_to() {
-        let mut harness = MigrationTestHarness::new(vec![
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
             Box::new(TestMigration3),
-        ]);
+        ]));
 
         assert_eq!(harness.current_version().unwrap(), 0);
 
@@ -470,8 +492,10 @@ mod tests {
 
     #[test]
     fn test_migrate_to_nonexistent_version() {
-        let mut harness =
-            MigrationTestHarness::new(vec![Box::new(TestMigration1), Box::new(TestMigration2)]);
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
 
         let result = harness.migrate_to(5);
         assert!(result.is_err());
@@ -483,8 +507,10 @@ mod tests {
 
     #[test]
     fn test_migrate_up_one() {
-        let mut harness =
-            MigrationTestHarness::new(vec![Box::new(TestMigration1), Box::new(TestMigration2)]);
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
 
         assert_eq!(harness.current_version().unwrap(), 0);
 
@@ -497,8 +523,10 @@ mod tests {
 
     #[test]
     fn test_migrate_down_one() {
-        let mut harness =
-            MigrationTestHarness::new(vec![Box::new(TestMigration1), Box::new(TestMigration2)]);
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
 
         harness.migrate_to(2).unwrap();
         assert_eq!(harness.current_version().unwrap(), 2);
@@ -512,7 +540,8 @@ mod tests {
 
     #[test]
     fn test_execute_and_query() {
-        let mut harness = MigrationTestHarness::new(vec![Box::new(TestMigration1)]);
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         harness
@@ -527,7 +556,8 @@ mod tests {
 
     #[test]
     fn test_query_all() {
-        let mut harness = MigrationTestHarness::new(vec![Box::new(TestMigration1)]);
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         harness
@@ -545,7 +575,8 @@ mod tests {
 
     #[test]
     fn test_assert_table_exists() {
-        let mut harness = MigrationTestHarness::new(vec![Box::new(TestMigration1)]);
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         harness.assert_table_exists("users").unwrap();
@@ -556,7 +587,8 @@ mod tests {
 
     #[test]
     fn test_assert_table_not_exists() {
-        let mut harness = MigrationTestHarness::new(vec![Box::new(TestMigration1)]);
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.assert_table_not_exists("users").unwrap();
 
@@ -567,8 +599,10 @@ mod tests {
 
     #[test]
     fn test_assert_column_exists() {
-        let mut harness =
-            MigrationTestHarness::new(vec![Box::new(TestMigration1), Box::new(TestMigration2)]);
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
 
         harness.migrate_to(1).unwrap();
         harness.assert_column_exists("users", "name").unwrap();
@@ -582,11 +616,11 @@ mod tests {
 
     #[test]
     fn test_assert_index_exists() {
-        let mut harness = MigrationTestHarness::new(vec![
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
             Box::new(TestMigration3),
-        ]);
+        ]));
 
         harness.migrate_to(2).unwrap();
         let result = harness.assert_index_exists("idx_users_email");
@@ -598,8 +632,10 @@ mod tests {
 
     #[test]
     fn test_capture_schema() {
-        let mut harness =
-            MigrationTestHarness::new(vec![Box::new(TestMigration1), Box::new(TestMigration2)]);
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
 
         harness.migrate_to(2).unwrap();
         let snapshot = harness.capture_schema().unwrap();
@@ -614,8 +650,10 @@ mod tests {
 
     #[test]
     fn test_schema_reversibility() {
-        let mut harness =
-            MigrationTestHarness::new(vec![Box::new(TestMigration1), Box::new(TestMigration2)]);
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(TestMigration1),
+            Box::new(TestMigration2),
+        ]));
 
         // Capture schema at version 2
         harness.migrate_to(2).unwrap();
@@ -634,7 +672,8 @@ mod tests {
 
     #[test]
     fn test_assert_schema_matches() {
-        let mut harness = MigrationTestHarness::new(vec![Box::new(TestMigration1)]);
+        let mut harness =
+            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         let snapshot = harness.capture_schema().unwrap();
@@ -696,10 +735,10 @@ mod tests {
             }
         }
 
-        let mut harness = MigrationTestHarness::new(vec![
+        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
             Box::new(DataTransformMigration1),
             Box::new(DataTransformMigration2),
-        ]);
+        ]));
 
         harness.migrate_to(1).unwrap();
         harness

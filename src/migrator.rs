@@ -575,6 +575,7 @@ impl SqliteMigrator {
         self.upgrade_internal(conn, None)
     }
 
+    /// TODO debug log when considering which migrations to run
     fn upgrade_internal(
         &self,
         conn: &mut Connection,
