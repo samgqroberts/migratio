@@ -1,6 +1,6 @@
 [package]
 name = "migratio"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Write DB migrations in Rust (similar to Alembic), currently for SQLite."
 license = "MIT"   # SPDX ID(s)
