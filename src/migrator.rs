@@ -575,7 +575,6 @@ impl SqliteMigrator {
         self.upgrade_internal(conn, None)
     }
 
-    /// TODO debug log when considering which migrations to run
     fn upgrade_internal(
         &self,
         conn: &mut Connection,
@@ -721,15 +720,36 @@ impl SqliteMigrator {
         let mut schema_version_table_created = false;
         // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
         let batch_applied_at = Utc::now().to_rfc3339();
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            current_version = current_version,
+            target_version = ?target_version,
+            available_migrations = ?migrations_sorted.iter().map(|(v, m)| (*v, m.name())).collect::<Vec<_>>(),
+            "Considering migrations to run"
+        );
+
         for (migration_version, migration) in migrations_sorted {
             // Stop if we've reached the target version (if specified)
             if let Some(target) = target_version {
                 if migration_version > target {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        migration_version = migration_version,
+                        target_version = target,
+                        "Skipping migration (beyond target version)"
+                    );
                     break;
                 }
             }
 
             if current_version < migration_version {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    migration_version = migration_version,
+                    migration_name = %migration.name(),
+                    "Migration needs to be applied"
+                );
                 #[cfg(feature = "tracing")]
                 let _span = tracing::info_span!(
                     "migration_up",
@@ -853,6 +873,13 @@ impl SqliteMigrator {
                         break;
                     }
                 }
+            } else {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    migration_version = migration_version,
+                    current_version = current_version,
+                    "Skipping migration (already applied)"
+                );
             }
         }
         // return report
