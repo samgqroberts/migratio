@@ -1,7 +1,7 @@
 use crate::error::Error;
 use chrono::Utc;
 use mysql::prelude::*;
-use mysql::{Conn, Transaction, TxOpts};
+use mysql::Conn;
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
@@ -80,11 +80,49 @@ pub trait MysqlMigration {
     /// - Must be immutable once the migration is applied to any database
     fn version(&self) -> u32;
 
-    fn up(&self, tx: &mut Transaction) -> Result<(), Error>;
+    /// Execute the migration's "up" logic.
+    ///
+    /// # MySQL DDL Behavior
+    ///
+    /// **IMPORTANT**: In MySQL, DDL statements (CREATE TABLE, ALTER TABLE, DROP TABLE, etc.)
+    /// cause an implicit commit and cannot be rolled back. This migration receives a direct
+    /// connection rather than a transaction to make this behavior explicit.
+    ///
+    /// If a migration fails partway through, any DDL statements that executed successfully
+    /// will remain applied to the database. The migration version will NOT be recorded,
+    /// allowing you to fix the issue and re-run.
+    ///
+    /// # Best Practices for MySQL Migrations
+    ///
+    /// 1. **Keep migrations small and focused** - Fewer statements mean less partial state on failure
+    /// 2. **Make migrations idempotent** - Use `IF EXISTS` / `IF NOT EXISTS` where possible
+    /// 3. **Test thoroughly** - DDL can't be rolled back automatically
+    /// 4. **Put risky DML before DDL** - Data changes can be manually rolled back if needed
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+    ///     // Idempotent DDL using IF NOT EXISTS
+    ///     conn.query_drop(
+    ///         "CREATE TABLE IF NOT EXISTS users (
+    ///             id INT PRIMARY KEY AUTO_INCREMENT,
+    ///             name VARCHAR(255) NOT NULL
+    ///         )"
+    ///     )?;
+    ///     Ok(())
+    /// }
+    /// ```
+    fn up(&self, conn: &mut Conn) -> Result<(), Error>;
 
     /// Rollback this migration. This is optional - the default implementation panics.
     /// If you want to support downgrade functionality, implement this method.
-    fn down(&self, _tx: &mut Transaction) -> Result<(), Error> {
+    ///
+    /// # MySQL DDL Behavior
+    ///
+    /// Same as `up()`, DDL statements in `down()` cannot be rolled back. Each statement
+    /// will be committed immediately.
+    fn down(&self, _conn: &mut Conn) -> Result<(), Error> {
         panic!(
             "Migration {} ('{}') does not support downgrade. Implement the down() method to enable rollback.",
             self.version(),
@@ -126,7 +164,7 @@ pub trait MysqlMigration {
     ///
     /// The default implementation returns `MysqlPrecondition::NeedsApply`, meaning migrations
     /// always run unless you override this method.
-    fn precondition(&self, _tx: &mut Transaction) -> Result<MysqlPrecondition, Error> {
+    fn precondition(&self, _conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
         Ok(MysqlPrecondition::NeedsApply)
     }
 }
@@ -619,55 +657,43 @@ impl MysqlMigrator {
 
                 let migration_start = Instant::now();
 
+                // Check precondition
+                let precondition = match migration.precondition(conn) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            error = %error,
+                            "Precondition check failed"
+                        );
+
+                        // Call on_migration_error hook
+                        if let Some(ref callback) = self.on_migration_error {
+                            callback(migration_version, &migration.name(), &error);
+                        }
+
+                        failing_migration = Some(MysqlMigrationFailure { migration, error });
+                        break;
+                    }
+                };
+
                 // Run migration or stamp if precondition is satisfied
-                // We wrap the transaction in a block to ensure it's dropped before using conn again
-                let migration_result = {
-                    // Start a transaction for this migration
-                    let mut tx = conn.start_transaction(TxOpts::default())?;
+                let migration_result = match precondition {
+                    MysqlPrecondition::AlreadySatisfied => {
+                        #[cfg(feature = "tracing")]
+                        tracing::info!("Precondition already satisfied, stamping migration without running up()");
 
-                    // Check precondition
-                    let precondition = match migration.precondition(&mut tx) {
-                        Ok(p) => p,
-                        Err(error) => {
-                            #[cfg(feature = "tracing")]
-                            tracing::error!(
-                                error = %error,
-                                "Precondition check failed"
-                            );
-
-                            // Call on_migration_error hook
-                            if let Some(ref callback) = self.on_migration_error {
-                                callback(migration_version, &migration.name(), &error);
-                            }
-
-                            // Transaction will be automatically rolled back when dropped
-                            failing_migration = Some(MysqlMigrationFailure { migration, error });
-                            break;
+                        // Call on_migration_skipped hook
+                        if let Some(ref callback) = self.on_migration_skipped {
+                            callback(migration_version, &migration.name());
                         }
-                    };
 
-                    match precondition {
-                        MysqlPrecondition::AlreadySatisfied => {
-                            #[cfg(feature = "tracing")]
-                            tracing::info!("Precondition already satisfied, stamping migration without running up()");
-
-                            // Call on_migration_skipped hook
-                            if let Some(ref callback) = self.on_migration_skipped {
-                                callback(migration_version, &migration.name());
-                            }
-
-                            // Commit the transaction (even though we didn't run up())
-                            tx.commit()?;
-                            Ok(())
-                        }
-                        MysqlPrecondition::NeedsApply => {
-                            let result = migration.up(&mut tx);
-                            if result.is_ok() {
-                                // Commit the transaction
-                                tx.commit()?;
-                            }
-                            result
-                        }
+                        Ok(())
+                    }
+                    MysqlPrecondition::NeedsApply => {
+                        // Run the migration directly on the connection
+                        // Note: In MySQL, DDL statements cause implicit commits and cannot be rolled back
+                        migration.up(conn)
                     }
                 };
 
@@ -894,15 +920,12 @@ impl MysqlMigrator {
 
             let migration_start = Instant::now();
 
-            // Start a transaction for this migration rollback
-            let mut tx = conn.start_transaction(TxOpts::default())?;
-            let migration_result = migration.down(&mut tx);
+            // Run the downgrade directly on the connection
+            // Note: In MySQL, DDL statements cause implicit commits and cannot be rolled back
+            let migration_result = migration.down(conn);
 
             match migration_result {
                 Ok(_) => {
-                    // Commit the transaction
-                    tx.commit()?;
-
                     let migration_duration = migration_start.elapsed();
 
                     #[cfg(feature = "tracing")]
@@ -940,7 +963,6 @@ impl MysqlMigrator {
                         callback(migration_version, &migration.name(), &e);
                     }
 
-                    // Transaction will be automatically rolled back when dropped
                     failing_migration = Some(MysqlMigrationFailure {
                         migration,
                         error: e,
@@ -975,8 +997,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1017,7 +1039,7 @@ mod tests {
     async fn single_unsuccessful_from_clean() {
         let (_pool, mut conn) = get_test_conn().await;
 
-        // Set up a table and some data to ensure it's preserved
+        // Set up a table and some data
         conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY, value INT)")
             .unwrap();
         conn.query_drop("INSERT INTO test (id, value) VALUES (1, 100)")
@@ -1037,12 +1059,12 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                // Do some DML operations that work (can be rolled back in MySQL)
-                tx.query_drop("UPDATE test SET value = value * 2")?;
-                tx.query_drop("INSERT INTO test (id, value) VALUES (3, 300)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                // Do some operations
+                conn.query_drop("UPDATE test SET value = value * 2")?;
+                conn.query_drop("INSERT INTO test (id, value) VALUES (3, 300)")?;
                 // Then do something that fails
-                tx.query_drop("THIS IS NOT VALID SQL")?;
+                conn.query_drop("THIS IS NOT VALID SQL")?;
                 Ok(())
             }
         }
@@ -1054,18 +1076,20 @@ mod tests {
         assert_eq!(report.migrations_run, Vec::<u32>::new());
         assert!(report.failing_migration.is_some());
 
-        // Verify test table still has original data (transaction was rolled back)
+        // IMPORTANT: In MySQL without transactions, the statements that executed successfully
+        // before the failure REMAIN APPLIED. This is the expected behavior - there's no rollback.
+        // The migration version is NOT recorded, allowing you to fix and re-run.
         let sum: i64 = conn
             .query_first("SELECT SUM(value) FROM test")
             .unwrap()
             .unwrap();
-        assert_eq!(sum, 300); // Should still be 300, not 600
+        assert_eq!(sum, 900); // Changes persisted: (100*2) + (200*2) + 300 + (original 100+200) = 900
 
         let count: i64 = conn
             .query_first("SELECT COUNT(*) FROM test")
             .unwrap()
             .unwrap();
-        assert_eq!(count, 2); // Should still be 2 rows, not 3
+        assert_eq!(count, 3); // INSERT succeeded, so we have 3 rows now
     }
 
     #[tokio::test]
@@ -1077,8 +1101,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE users (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE users (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1088,8 +1112,8 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE posts (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE posts (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1099,8 +1123,8 @@ mod tests {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE comments (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE comments (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1149,8 +1173,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1169,9 +1193,9 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE users (id INT PRIMARY KEY)")?;
-                tx.query_drop("INSERT INTO users VALUES (1), (2)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE users (id INT PRIMARY KEY)")?;
+                conn.query_drop("INSERT INTO users VALUES (1), (2)")?;
                 Ok(())
             }
         }
@@ -1181,8 +1205,8 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("INVALID SQL")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("INVALID SQL")?;
                 Ok(())
             }
         }
@@ -1209,7 +1233,7 @@ mod tests {
             fn version(&self) -> u32 {
                 0
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1224,7 +1248,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1234,7 +1258,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1244,7 +1268,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1264,7 +1288,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1274,7 +1298,7 @@ mod tests {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1290,7 +1314,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1300,7 +1324,7 @@ mod tests {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1315,7 +1339,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1334,7 +1358,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1344,7 +1368,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1354,7 +1378,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1375,7 +1399,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1385,7 +1409,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1404,8 +1428,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1422,8 +1446,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1447,8 +1471,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1461,8 +1485,8 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1489,8 +1513,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1519,12 +1543,12 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("DROP TABLE test")?;
+            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("DROP TABLE test")?;
                 Ok(())
             }
         }
@@ -1560,12 +1584,12 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("DROP TABLE test1")?;
+            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("DROP TABLE test1")?;
                 Ok(())
             }
         }
@@ -1575,12 +1599,12 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("DROP TABLE test2")?;
+            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("DROP TABLE test2")?;
                 Ok(())
             }
         }
@@ -1590,12 +1614,12 @@ mod tests {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test3 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test3 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("DROP TABLE test3")?;
+            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("DROP TABLE test3")?;
                 Ok(())
             }
         }
@@ -1626,10 +1650,10 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
-            fn down(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn down(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1648,12 +1672,12 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("DROP TABLE test")?;
+            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("DROP TABLE test")?;
                 Ok(())
             }
         }
@@ -1676,8 +1700,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1696,7 +1720,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1715,8 +1739,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1726,8 +1750,8 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1748,7 +1772,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1758,7 +1782,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1780,8 +1804,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1791,8 +1815,8 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
         }
@@ -1802,7 +1826,7 @@ mod tests {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1833,12 +1857,12 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("DROP TABLE test1")?;
+            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("DROP TABLE test1")?;
                 Ok(())
             }
         }
@@ -1848,12 +1872,12 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("DROP TABLE test2")?;
+            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("DROP TABLE test2")?;
                 Ok(())
             }
         }
@@ -1876,7 +1900,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1895,8 +1919,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1909,8 +1933,8 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1940,8 +1964,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -1987,7 +2011,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Err(Error::Generic("Test error".to_string()))
             }
             fn name(&self) -> String {
@@ -2039,13 +2063,13 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 self.up_called.set(true);
                 Ok(())
             }
-            fn precondition(&self, tx: &mut Transaction) -> Result<MysqlPrecondition, Error> {
+            fn precondition(&self, conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
                 // Check if table exists
-                let exists: i64 = tx
+                let exists: i64 = conn
                     .query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'test'")?
                     .unwrap();
                 if exists > 0 {
@@ -2085,12 +2109,12 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn precondition(&self, tx: &mut Transaction) -> Result<MysqlPrecondition, Error> {
-                let exists: i64 = tx
+            fn precondition(&self, conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
+                let exists: i64 = conn
                     .query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'test'")?
                     .unwrap();
                 if exists > 0 {
@@ -2121,10 +2145,10 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
-            fn precondition(&self, _tx: &mut Transaction) -> Result<MysqlPrecondition, Error> {
+            fn precondition(&self, _conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
                 Err(Error::Generic("Precondition check failed".to_string()))
             }
         }
@@ -2146,7 +2170,7 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Err(Error::Generic("Test error".to_string()))
             }
             fn name(&self) -> String {
@@ -2159,7 +2183,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _tx: &mut Transaction) -> Result<(), Error> {
+            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -2183,8 +2207,8 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -2197,8 +2221,8 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
@@ -2211,8 +2235,8 @@ mod tests {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
-                tx.query_drop("CREATE TABLE test3 (id INT PRIMARY KEY)")?;
+            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+                conn.query_drop("CREATE TABLE test3 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
