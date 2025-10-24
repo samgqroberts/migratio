@@ -833,10 +833,19 @@
 mod error;
 mod migrator;
 
+#[cfg(feature = "mysql")]
+pub mod mysql_migrator;
+
 #[cfg(feature = "testing")]
 pub mod testing;
 
 pub use error::Error;
 pub use migrator::{
     AppliedMigration, Migration, MigrationFailure, MigrationReport, Precondition, SqliteMigrator,
+};
+
+#[cfg(feature = "mysql")]
+pub use mysql_migrator::{
+    MysqlAppliedMigration, MysqlMigration, MysqlMigrationFailure, MysqlMigrationReport,
+    MysqlMigrator, MysqlPrecondition,
 };

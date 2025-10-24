@@ -1,12 +1,19 @@
 # migratio
 
-`migratio` is a lightweight library for managing database migrations (currently for Sqlite).
+`migratio` is a lightweight library for managing database migrations for SQLite and MySQL.
 
 Core concepts:
 - `migratio` supplies migration definitions with a live connection to the database, allowing more expressive migration logic than just preparing SQL statements.
 - `migratio` is a code-first library, making embedding it in your application easier than other CLI-first libraries.
 
-## Example
+## Database Support
+
+- **SQLite** - Full support with `SqliteMigrator` (default)
+- **MySQL** - Full support with `MysqlMigrator` (enable with `mysql` feature)
+
+See [MYSQL.md](MYSQL.md) for MySQL-specific documentation and examples.
+
+## Example (SQLite)
 
 ```rust
 use migratio::{Migration, SqliteMigrator, MigrationReport, Error};

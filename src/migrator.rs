@@ -3922,7 +3922,7 @@ mod tests {
         let report = migrator.upgrade(&mut conn).unwrap();
 
         // Verify migration failed
-        assert_eq!(report.migrations_run, vec![]);
+        assert_eq!(report.migrations_run, Vec::<u32>::new());
         assert!(report.failing_migration.is_some());
 
         let failure = report.failing_migration.unwrap();
