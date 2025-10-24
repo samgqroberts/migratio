@@ -831,7 +831,7 @@
 //!
 
 mod error;
-mod migrator;
+mod sqlite_migrator;
 
 #[cfg(feature = "mysql")]
 pub mod mysql_migrator;
@@ -843,7 +843,7 @@ pub mod testing;
 pub(crate) mod test_mysql;
 
 pub use error::Error;
-pub use migrator::{
+pub use sqlite_migrator::{
     AppliedMigration, Migration, MigrationFailure, MigrationReport, Precondition, SqliteMigrator,
 };
 
