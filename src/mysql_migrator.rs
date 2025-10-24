@@ -961,144 +961,14 @@ impl MysqlMigrator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, RwLock, RwLockReadGuard};
-    use std::time::Duration;
-
     use super::*;
-    use mysql::Conn;
-    use mysql::{Opts, Pool, PooledConn};
-
-    use testcontainers::core::logs::LogFrame;
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-    use uuid::Uuid;
-
-    static MYSQL_INNER: RwLock<Option<ContainerAsync<GenericImage>>> = RwLock::new(None);
-
-    async fn mysql() -> RwLockReadGuard<'static, Option<ContainerAsync<GenericImage>>> {
-        println!("requesting mysql");
-        {
-            let mut mysql = MYSQL_INNER.write().unwrap();
-            if mysql.is_none() {
-                let created = create_mysql_image_async().await;
-                *mysql = Some(created);
-            }
-        }
-        let x = MYSQL_INNER.read().unwrap();
-        x
-    }
-
-    async fn create_mysql_image_async() -> ContainerAsync<GenericImage> {
-        println!("creating mysql image");
-
-        let temporary_server_started = Arc::new(AtomicBool::new(false));
-        let mysql_ready = Arc::new(AtomicBool::new(false));
-        let temp_clone = Arc::clone(&temporary_server_started);
-        let mysql_clone = Arc::clone(&mysql_ready);
-        let log_consumer = move |log: &LogFrame| {
-            let msg = format!("{:?}", log);
-            println!("{:?}", msg);
-            if msg.contains("Temporary server started") {
-                println!("Temporary server started");
-                temp_clone.store(true, Ordering::SeqCst);
-            } else if temp_clone.load(Ordering::SeqCst)
-                && msg.contains("/usr/sbin/mysqld: ready for connections")
-            {
-                println!("MySQL server ready");
-                mysql_clone.store(true, Ordering::SeqCst);
-            }
-        };
-        let image = GenericImage::new("mysql", "8.4")
-            .with_log_consumer(log_consumer)
-            .with_env_var("MYSQL_ROOT_PASSWORD", "rootpw")
-            .with_env_var("MYSQL_DATABASE", "bootstrap");
-        println!("starting");
-        let started = AsyncRunner::start(image)
-            .await
-            .expect("failed to start mysql docker image");
-        println!("started");
-        while !mysql_ready.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        println!("waited as well");
-        println!("setting max connections");
-        // Connect to bootstrap DB as admin
-        let port = started.get_host_port_ipv4(3306).await.unwrap();
-        let admin_url = format!("mysql://root:rootpw@127.0.0.1:{port}");
-        let admin_pool = Pool::new(Opts::from_url(&admin_url).expect("parse admin url"))
-            .expect("create admin pool");
-        let mut admin: PooledConn = admin_pool.get_conn().expect("failed to get admin conn");
-        admin
-            .query_drop("SET GLOBAL max_connections = 1000")
-            .expect("failed to set max connections");
-        started
-    }
-
-    async fn mysql_base_url() -> String {
-        let port = dbg!(mysql()
-            .await
-            .as_ref()
-            .unwrap()
-            .get_host_port_ipv4(3306)
-            .await
-            .unwrap());
-        dbg!(format!("mysql://root:rootpw@127.0.0.1:{port}"))
-    }
-
-    async fn url_with_db(db: &str) -> String {
-        format!("{}/{}", mysql_base_url().await, db)
-    }
-
-    /// Create a unique DB per test and return a Pool to it.
-    async fn fresh_mysql_db() -> (Pool, String) {
-        // Connect to bootstrap DB as admin
-        let admin_url = url_with_db("bootstrap").await;
-        let admin_pool = Pool::new(Opts::from_url(&admin_url).expect("parse admin url"))
-            .expect("create admin pool");
-        let mut admin: PooledConn = admin_pool.get_conn().expect("failed to get admin conn");
-
-        // Create a DB with utf8mb4; use a safe name
-        let db_name = format!("test_{}", Uuid::new_v4().simple());
-        // Collation note:
-        // - MySQL 8 supports utf8mb4_0900_ai_ci; MariaDB doesn't. Use a MySQL8 collation,
-        //   and if it ever errors (e.g. if you swap image to mariadb), fall back.
-        let create_stmt = format!(
-            "CREATE DATABASE `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci",
-            db_name
-        );
-        if admin.exec_drop(&create_stmt, ()).is_err() {
-            // Fallback for MariaDB
-            admin
-                .exec_drop(
-                    format!(
-                        "CREATE DATABASE `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
-                        db_name
-                    ),
-                    (),
-                )
-                .expect("create db (fallback)");
-        }
-
-        // Connect pool to the fresh DB
-        let url = url_with_db(&db_name).await;
-        let pool =
-            Pool::new(Opts::from_url(&url).expect("parse test url")).expect("create test pool");
-
-        (pool, db_name)
-    }
+    use crate::test_mysql::get_test_conn;
 
     #[tokio::test]
     async fn single_successful_from_clean() {
-        println!("start test");
         use chrono::{DateTime, FixedOffset};
 
-        let (pool, _) = fresh_mysql_db().await;
-
-        println!("created fresh db");
-
-        let conn = pool.get_conn().expect("Failed to get connection from pool");
-        let mut conn = conn.unwrap();
+        let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
         impl MysqlMigration for Migration1 {
@@ -1141,12 +1011,6 @@ mod tests {
         let now = Utc::now();
         let diff = now.timestamp() - date.timestamp();
         assert!(diff < 5);
-    }
-
-    async fn get_test_conn() -> (Pool, Conn) {
-        let (pool, _db_name) = fresh_mysql_db().await;
-        let conn = pool.get_conn().unwrap().unwrap();
-        (pool, conn)
     }
 
     #[tokio::test]
@@ -2375,15 +2239,5 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not applied"));
-    }
-
-    #[ctor::dtor]
-    fn stop_shared_mysql() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            if let Some(c) = MYSQL_INNER.write().unwrap().take() {
-                drop(c);
-            }
-        })
     }
 }

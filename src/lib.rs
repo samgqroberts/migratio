@@ -839,6 +839,9 @@ pub mod mysql_migrator;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+#[cfg(all(test, feature = "mysql"))]
+pub(crate) mod test_mysql;
+
 pub use error::Error;
 pub use migrator::{
     AppliedMigration, Migration, MigrationFailure, MigrationReport, Precondition, SqliteMigrator,
