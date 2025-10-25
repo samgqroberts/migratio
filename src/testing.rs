@@ -1,14 +1,16 @@
 //! Testing utilities for migration development and verification.
 //!
-//! This module provides a test harness for writing comprehensive migration tests,
+//! This module provides test harnesses for writing comprehensive migration tests,
 //! including data transformation tests, schema validation, and reversibility checks.
+//!
+//! Currently only SQLite is supported, but MySQL support is planned.
 
 use crate::{sqlite::SqliteMigrator, Error};
 use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// A test harness for migration testing that provides state control and assertion helpers.
+/// A test harness for SQLite migration testing that provides state control and assertion helpers.
 ///
 /// # Example
 ///
@@ -17,7 +19,7 @@ use std::collections::HashMap;
 /// # fn main() {}
 /// # #[cfg(feature = "sqlite")]
 /// # fn main() {
-/// use migratio::testing::MigrationTestHarness;
+/// use migratio::testing::SqliteTestHarness;
 /// use migratio::{Migration, Error};
 /// use migratio::sqlite::SqliteMigrator;
 /// use rusqlite::Transaction;
@@ -38,7 +40,7 @@ use std::collections::HashMap;
 /// }
 ///
 /// # fn test() -> Result<(), Error> {
-/// let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1)]));
+/// let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1)]));
 ///
 /// // Migrate to version 1
 /// harness.migrate_to(1)?;
@@ -56,7 +58,7 @@ use std::collections::HashMap;
 /// # }
 /// # }
 /// ```
-pub struct MigrationTestHarness {
+pub struct SqliteTestHarness {
     conn: Connection,
     migrator: SqliteMigrator,
 }
@@ -95,8 +97,8 @@ pub struct IndexInfo {
     pub sql: String,
 }
 
-impl MigrationTestHarness {
-    /// Create a new test harness with the given migrator.
+impl SqliteTestHarness {
+    /// Create a new test harness with the given SQLite migrator.
     /// This should be the same migrator that is used in the production environment:
     /// as it changes, asserts on previous migrations SHOULD NOT CHANGE.
     ///
@@ -112,7 +114,7 @@ impl MigrationTestHarness {
     ///
     /// and then in each test, construct the harness like:
     /// ```ignore
-    /// let harness = MigrationTestHarness::new(migrator());
+    /// let harness = SqliteTestHarness::new(migrator());
     /// ```
     ///
     /// Uses an in-memory SQLite database by default.
@@ -121,10 +123,10 @@ impl MigrationTestHarness {
         Self { conn, migrator }
     }
 
-    /// Create a test harness with a custom connection.
+    /// Create a test harness with a custom SQLite connection.
     /// Useful for testing with file-based databases or custom settings.
     ///
-    /// See [MigrationTestHarness::new] for more information.
+    /// See [`SqliteTestHarness::new`] for more information.
     pub fn with_connection(conn: Connection, migrator: SqliteMigrator) -> Self {
         Self { conn, migrator }
     }
@@ -309,7 +311,7 @@ impl MigrationTestHarness {
         Ok(())
     }
 
-    /// Capture the current database schema as a snapshot.
+    /// Capture the current SQLite database schema as a snapshot.
     pub fn capture_schema(&mut self) -> Result<SchemaSnapshot, Error> {
         let mut tables = HashMap::new();
 
@@ -456,7 +458,7 @@ impl MigrationTestHarness {
     }
 }
 
-#[cfg(all(test, not(feature = "mysql")))]
+#[cfg(test)]
 mod tests {
     use crate::Migration;
 
@@ -478,6 +480,10 @@ mod tests {
         }
         fn name(&self) -> String {
             "create_users_table".to_string()
+        }
+        #[cfg(feature = "mysql")]
+        fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+            Ok(())
         }
     }
 
@@ -503,6 +509,10 @@ mod tests {
         fn name(&self) -> String {
             "add_email_column".to_string()
         }
+        #[cfg(feature = "mysql")]
+        fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     struct TestMigration3;
@@ -521,11 +531,15 @@ mod tests {
         fn name(&self) -> String {
             "add_email_index".to_string()
         }
+        #[cfg(feature = "mysql")]
+        fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
     #[test]
     fn test_migrate_to() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
             Box::new(TestMigration3),
@@ -545,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_migrate_to_nonexistent_version() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -560,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_migrate_up_one() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -576,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_migrate_down_one() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -594,7 +608,7 @@ mod tests {
     #[test]
     fn test_execute_and_query() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         harness
@@ -610,7 +624,7 @@ mod tests {
     #[test]
     fn test_query_all() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         harness
@@ -629,7 +643,7 @@ mod tests {
     #[test]
     fn test_assert_table_exists() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         harness.assert_table_exists("users").unwrap();
@@ -641,7 +655,7 @@ mod tests {
     #[test]
     fn test_assert_table_not_exists() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.assert_table_not_exists("users").unwrap();
 
@@ -652,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_assert_column_exists() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -669,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_assert_index_exists() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
             Box::new(TestMigration3),
@@ -685,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_capture_schema() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -703,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_schema_reversibility() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -726,7 +740,7 @@ mod tests {
     #[test]
     fn test_assert_schema_matches() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         let snapshot = harness.capture_schema().unwrap();
@@ -745,7 +759,7 @@ mod tests {
     #[test]
     fn test_assert_schema_matches_error_missing_table() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         let snapshot = harness.capture_schema().unwrap();
@@ -770,7 +784,7 @@ mod tests {
     #[test]
     fn test_assert_schema_matches_error_unexpected_table() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         let snapshot = harness.capture_schema().unwrap();
@@ -797,7 +811,7 @@ mod tests {
     #[test]
     fn test_assert_schema_matches_error_column_added() {
         let mut harness =
-            MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
+            SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(TestMigration1)]));
 
         harness.migrate_to(1).unwrap();
         let snapshot = harness.capture_schema().unwrap();
@@ -825,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_assert_schema_matches_error_index_mismatch() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -856,7 +870,7 @@ mod tests {
 
     #[test]
     fn test_assert_schema_matches_error_multiple_differences() {
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(TestMigration1),
             Box::new(TestMigration2),
         ]));
@@ -904,6 +918,10 @@ mod tests {
                 tx.execute("DROP TABLE prefs", [])?;
                 Ok(())
             }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         struct DataTransformMigration2;
@@ -933,9 +951,13 @@ mod tests {
                 // Down not needed for this test
                 Ok(())
             }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
-        let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
             Box::new(DataTransformMigration1),
             Box::new(DataTransformMigration2),
         ]));

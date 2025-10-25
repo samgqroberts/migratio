@@ -718,7 +718,7 @@
 //! migratio = { version = "0.1", features = ["testing"] }
 //! ```
 //!
-//! The `MigrationTestHarness` provides controlled migration state management, query helpers,
+//! The `SqliteTestHarness` provides controlled migration state management, query helpers,
 //! and schema assertions:
 //!
 //! ```rust
@@ -726,7 +726,7 @@
 //! # fn main() {}
 //! # #[cfg(feature = "testing")]
 //! # fn main() {
-//! use migratio::testing::MigrationTestHarness;
+//! use migratio::testing::SqliteTestHarness;
 //! use migratio::{Migration, Error};
 //! use migratio::sqlite::SqliteMigrator;
 //! use rusqlite::Transaction;
@@ -748,7 +748,7 @@
 //!
 //! // in legitimate cases, this function would be a #[test]
 //! fn test_migration_1() {
-//!     let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1)]));
+//!     let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1)]));
 //!
 //!     // Migrate to version 1
 //!     harness.migrate_to(1).unwrap();
@@ -782,7 +782,7 @@
 //! # fn main() {}
 //! # #[cfg(feature = "testing")]
 //! # fn main() {
-//! use migratio::{Migration, MigrationReport, Error, testing::MigrationTestHarness};
+//! use migratio::{Migration, MigrationReport, Error, testing::SqliteTestHarness};
 //! use migratio::sqlite::SqliteMigrator;
 //! use rusqlite::Transaction;
 //!
@@ -843,7 +843,7 @@
 //!
 //! // in legitimate cases, this function would be a #[test]
 //! fn test_data_transformation_migration() {
-//!     let mut harness = MigrationTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]));
+//!     let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![Box::new(Migration1), Box::new(Migration2)]));
 //!
 //!     // Set up test data in old format
 //!     harness.migrate_to(1).unwrap();
