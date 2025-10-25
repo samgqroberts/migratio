@@ -16,7 +16,7 @@ include = ["/src", "LICENSE"]
 [dependencies]
 chrono = "0.4.42"
 rusqlite = { version = ">=0.30, <=0.37", default-features = false, optional = true }
-mysql = { version = "25.0", optional = true }
+mysql = { version = ">=24.0, <=26.0", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10"
