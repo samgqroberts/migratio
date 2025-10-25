@@ -726,7 +726,7 @@
 //! # fn main() {}
 //! # #[cfg(feature = "testing")]
 //! # fn main() {
-//! use migratio::testing::SqliteTestHarness;
+//! use migratio::testing::sqlite::SqliteTestHarness;
 //! use migratio::{Migration, Error};
 //! use migratio::sqlite::SqliteMigrator;
 //! use rusqlite::Transaction;
@@ -782,7 +782,7 @@
 //! # fn main() {}
 //! # #[cfg(feature = "testing")]
 //! # fn main() {
-//! use migratio::{Migration, MigrationReport, Error, testing::SqliteTestHarness};
+//! use migratio::{Migration, MigrationReport, Error, testing::sqlite::SqliteTestHarness};
 //! use migratio::sqlite::SqliteMigrator;
 //! use rusqlite::Transaction;
 //!
