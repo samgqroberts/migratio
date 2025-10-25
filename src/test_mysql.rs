@@ -156,3 +156,15 @@ pub async fn get_test_conn() -> (Pool, Conn) {
     let conn = pool.get_conn().unwrap().unwrap();
     (pool, conn)
 }
+
+#[ctor::dtor]
+fn stop_shared_mysql() {
+    let Ok(rt) = tokio::runtime::Runtime::new() else {
+        return;
+    };
+    rt.block_on(async {
+        if let Some(c) = MYSQL_INNER.write().unwrap().take() {
+            drop(c);
+        }
+    })
+}
