@@ -22,7 +22,7 @@
 //! A central use case for `migratio` is embedding migration logic within an application, usually in the startup procedure.
 //! This way, when the application updates, the next time it starts the database will automatically be migrated to the latest version without any manual intervention.
 //!
-//! Anywhere you can construct a [SqliteMigrator] or [MysqlMigrator] instance, you can access any feature this library provides.
+//! Anywhere you can construct a [sqlite::SqliteMigrator] or [mysql::MysqlMigrator] instance, you can access any feature this library provides.
 //!
 //! # Features:
 //! - Easy adoption from other migration tools, or no migration tool.
@@ -49,8 +49,6 @@ pub mod sqlite;
 
 #[cfg(feature = "mysql")]
 pub mod mysql;
-#[cfg(feature = "mysql")]
-pub use mysql::MysqlMigrator;
 
 #[cfg(feature = "testing")]
 pub mod testing;

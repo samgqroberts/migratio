@@ -322,7 +322,7 @@
 //! Even if you have `CREATE TABLE` statements in the old tool, you can translate them to `CREATE TABLE IF NOT EXISTS` in the `migratio` migrations.
 //! The idempotence will ensure that in each of the 3 initial states the database could be in, it will be brought to the desired state.
 //!
-//! Another approach is to use the [Migration::precondition] method to check if the migration should be applied again.
+//! Another approach is to use the [Migration::sqlite_precondition] method to check if the migration should be applied again.
 //!
 //! ```
 //! # use migratio::{Migration, Precondition, Error};
