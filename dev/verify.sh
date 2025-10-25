@@ -33,6 +33,13 @@ function run_step() {
 echo "Code verification"
 echo "======================"
 
-run_step "RUSTFLAGS='-D warnings' cargo test --all-features" "Rust tests" "" || exit 1
-
-run_step "RUSTFLAGS='-D warnings' cargo test --doc" "Doctests with no features" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test" "Rust tests (no features)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features sqlite" "Rust tests (sqlite)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features sqlite,tracing" "Rust tests (sqlite,tracing)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features sqlite,tracing,testing" "Rust tests (sqlite,tracing,testing)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features mysql" "Rust tests (mysql)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features mysql,tracing" "Rust tests (mysql,tracing)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features mysql,tracing,testing" "Rust tests (mysql,tracing,testing)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features sqlite,mysql" "Rust tests (sqlite,mysql)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features sqlite,mysql,tracing" "Rust tests (sqlite,mysql,tracing)" "" || exit 1
+run_step "RUSTFLAGS='-D warnings' cargo test --features sqlite,mysql,tracing,testing" "Rust tests (sqlite,mysql,tracing,testing)" "" || exit 1

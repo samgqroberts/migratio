@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! MySQL test infrastructure module.
 //!
 //! This module provides shared infrastructure for MySQL integration tests,

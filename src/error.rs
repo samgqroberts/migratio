@@ -1,6 +1,7 @@
 /// Error type for the migratio crate.
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum Error {
+    #[cfg(feature = "sqlite")]
     #[error("{0}")]
     Rusqlite(rusqlite::Error),
     #[cfg(feature = "mysql")]
@@ -10,6 +11,7 @@ pub enum Error {
     Generic(String),
 }
 
+#[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for Error {
     fn from(value: rusqlite::Error) -> Self {
         Self::Rusqlite(value)

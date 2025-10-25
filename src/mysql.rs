@@ -1,194 +1,21 @@
+use crate::core::DEFAULT_VERSION_TABLE_NAME;
 use crate::error::Error;
+use crate::AppliedMigration;
+use crate::Migration;
+use crate::MigrationFailure;
+use crate::MigrationReport;
+use crate::Precondition;
 use chrono::Utc;
 use mysql::prelude::*;
 use mysql::Conn;
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
-/// Represents a failure during a migration.
-#[derive(Debug, PartialEq)]
-pub struct MysqlMigrationFailure<'migration> {
-    migration: &'migration Box<dyn MysqlMigration>,
-    error: Error,
-}
-
-impl<'migration> MysqlMigrationFailure<'migration> {
-    /// Get the migration that failed.
-    pub fn migration(&self) -> &dyn MysqlMigration {
-        self.migration.as_ref()
-    }
-
-    /// Get the error that caused the migration to fail.
-    pub fn error(&self) -> &Error {
-        &self.error
-    }
-}
-
-/// A report of actions performed during a migration.
-#[derive(Debug, PartialEq)]
-pub struct MysqlMigrationReport<'migration> {
-    pub schema_version_table_existed: bool,
-    pub schema_version_table_created: bool,
-    pub migrations_run: Vec<u32>,
-    pub failing_migration: Option<MysqlMigrationFailure<'migration>>,
-}
-
-/// Represents the result of a migration precondition check.
-#[derive(Debug, Clone, PartialEq)]
-pub enum MysqlPrecondition {
-    /// The migration's changes are already present in the database and should be stamped without running up().
-    AlreadySatisfied,
-    /// The migration needs to be applied by running up().
-    NeedsApply,
-}
-
-/// Represents a migration that has been applied to the database.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MysqlAppliedMigration {
-    /// The version number of the migration.
-    pub version: u32,
-    /// The name of the migration.
-    pub name: String,
-    /// The timestamp when the migration was applied.
-    pub applied_at: chrono::DateTime<Utc>,
-    /// The checksum of the migration at the time it was applied.
-    pub checksum: String,
-}
-
-const DEFAULT_VERSION_TABLE_NAME: &str = "_migratio_version_";
-
-/// A trait that must be implemented to define a MySQL migration.
-/// The `version` value must be unique among all migrations supplied to the migrator, and greater than 0.
-/// Implement your migration logic in the `up` method, using the supplied [Transaction] to perform database operations.
-/// The transaction will be automatically committed if the migration succeeds, or rolled back if it fails.
-/// Optionally implement the `down` method to enable rollback support via [MysqlMigrator::downgrade].
-/// The `name` and `description` methods are optional, and only aid in debugging / observability.
-pub trait MysqlMigration {
-    /// Returns the version number of this migration.
-    ///
-    /// # IMPORTANT WARNING
-    ///
-    /// **Once a migration has been applied to any database, its version number must NEVER be changed.**
-    /// The version is used to track which migrations have been applied. Changing it will cause
-    /// the migrator to fail validation with an error about missing or orphaned migrations.
-    ///
-    /// # Requirements
-    ///
-    /// - Must be greater than 0
-    /// - Must be unique across all migrations
-    /// - Must be contiguous (1, 2, 3, ... with no gaps)
-    /// - Must be immutable once the migration is applied to any database
-    fn version(&self) -> u32;
-
-    /// Execute the migration's "up" logic.
-    ///
-    /// # MySQL DDL Behavior
-    ///
-    /// **IMPORTANT**: In MySQL, DDL statements (CREATE TABLE, ALTER TABLE, DROP TABLE, etc.)
-    /// cause an implicit commit and cannot be rolled back. This migration receives a direct
-    /// connection rather than a transaction to make this behavior explicit.
-    ///
-    /// If a migration fails partway through, any DDL statements that executed successfully
-    /// will remain applied to the database. The migration version will NOT be recorded,
-    /// allowing you to fix the issue and re-run.
-    ///
-    /// # Best Practices for MySQL Migrations
-    ///
-    /// 1. **Keep migrations small and focused** - Fewer statements mean less partial state on failure
-    /// 2. **Make migrations idempotent** - Use `IF EXISTS` / `IF NOT EXISTS` where possible
-    /// 3. **Test thoroughly** - DDL can't be rolled back automatically
-    /// 4. **Put risky DML before DDL** - Data changes can be manually rolled back if needed
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// fn up(&self, conn: &mut Conn) -> Result<(), Error> {
-    ///     // Idempotent DDL using IF NOT EXISTS
-    ///     conn.query_drop(
-    ///         "CREATE TABLE IF NOT EXISTS users (
-    ///             id INT PRIMARY KEY AUTO_INCREMENT,
-    ///             name VARCHAR(255) NOT NULL
-    ///         )"
-    ///     )?;
-    ///     Ok(())
-    /// }
-    /// ```
-    fn up(&self, conn: &mut Conn) -> Result<(), Error>;
-
-    /// Rollback this migration. This is optional - the default implementation panics.
-    /// If you want to support downgrade functionality, implement this method.
-    ///
-    /// # MySQL DDL Behavior
-    ///
-    /// Same as `up()`, DDL statements in `down()` cannot be rolled back. Each statement
-    /// will be committed immediately.
-    fn down(&self, _conn: &mut Conn) -> Result<(), Error> {
-        panic!(
-            "Migration {} ('{}') does not support downgrade. Implement the down() method to enable rollback.",
-            self.version(),
-            self.name()
-        )
-    }
-
-    /// Returns the name of this migration.
-    ///
-    /// # IMPORTANT WARNING
-    ///
-    /// **Once a migration has been applied to any database, its name must NEVER be changed.**
-    /// The name is included in the checksum used to verify migration integrity. Changing it
-    /// will cause the migrator to fail with a checksum mismatch error.
-    ///
-    /// The default implementation returns "Migration {version}". You can override this to
-    /// provide a more descriptive name, but remember: once applied, it's permanent.
-    fn name(&self) -> String {
-        format!("Migration {}", self.version())
-    }
-
-    /// Returns an optional description of what this migration does.
-    ///
-    /// Unlike `version()` and `name()`, the description can be changed at any time as it's
-    /// not used for migration tracking or validation. Use this for human-readable documentation.
-    fn description(&self) -> Option<&'static str> {
-        None
-    }
-
-    /// Optional precondition check for the migration.
-    ///
-    /// This method is called before running the migration's `up()` method during upgrade.
-    /// It allows the migration to check if its changes are already present in the database
-    /// (for example, when adopting migratio after using another migration tool).
-    ///
-    /// If this returns `MysqlPrecondition::AlreadySatisfied`, the migration is stamped as applied
-    /// in the version table without running `up()`. If it returns `MysqlPrecondition::NeedsApply`,
-    /// the migration runs normally via `up()`.
-    ///
-    /// The default implementation returns `MysqlPrecondition::NeedsApply`, meaning migrations
-    /// always run unless you override this method.
-    fn precondition(&self, _conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
-        Ok(MysqlPrecondition::NeedsApply)
-    }
-}
-
-impl PartialEq for dyn MysqlMigration {
-    fn eq(&self, other: &Self) -> bool {
-        self.version() == other.version()
-    }
-}
-
-impl std::fmt::Debug for dyn MysqlMigration {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MysqlMigration")
-            .field("version", &self.version())
-            .field("name", &self.name())
-            .finish()
-    }
-}
-
-/// The entrypoint for running a sequence of [MysqlMigration]s.
-/// Construct this struct with the list of all [MysqlMigration]s to be applied.
-/// [MysqlMigration::version]s must be contiguous, greater than zero, and unique.
+/// The entrypoint for running a sequence of [Migration]s on a MySQL database.
+/// Construct this struct with the list of all [Migration]s to be applied.
+/// [Migration::version]s must be contiguous, greater than zero, and unique.
 pub struct MysqlMigrator {
-    migrations: Vec<Box<dyn MysqlMigration>>,
+    migrations: Vec<Box<dyn Migration>>,
     schema_version_table_name: String,
     on_migration_start: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
     on_migration_complete: Option<Box<dyn Fn(u32, &str, std::time::Duration) + Send + Sync>>,
@@ -216,7 +43,7 @@ impl std::fmt::Debug for MysqlMigrator {
 impl MysqlMigrator {
     /// Calculate a checksum for a migration based on its version and name.
     /// This is used to verify that migrations haven't been modified after being applied.
-    fn calculate_checksum(migration: &Box<dyn MysqlMigration>) -> String {
+    fn calculate_checksum(migration: &Box<dyn Migration>) -> String {
         let mut hasher = Sha256::new();
         hasher.update(migration.version().to_string().as_bytes());
         hasher.update(b"|");
@@ -226,7 +53,7 @@ impl MysqlMigrator {
 
     /// Create a new MysqlMigrator, validating migration invariants.
     /// Returns an error if migrations are invalid.
-    pub fn try_new(migrations: Vec<Box<dyn MysqlMigration>>) -> Result<Self, String> {
+    pub fn try_new(migrations: Vec<Box<dyn Migration>>) -> Result<Self, String> {
         // Verify invariants
         let mut versions: Vec<u32> = migrations.iter().map(|m| m.version()).collect();
         versions.sort();
@@ -276,7 +103,7 @@ impl MysqlMigrator {
 
     /// Create a new MysqlMigrator, panicking if migration metadata is invalid.
     /// For a non-panicking version, use `try_new`.
-    pub fn new(migrations: Vec<Box<dyn MysqlMigration>>) -> Self {
+    pub fn new(migrations: Vec<Box<dyn Migration>>) -> Self {
         match Self::try_new(migrations) {
             Ok(migrator) => migrator,
             Err(err) => panic!("{}", err),
@@ -311,7 +138,7 @@ impl MysqlMigrator {
     }
 
     /// Set a callback to be invoked when a migration is skipped because its precondition
-    /// returned `MysqlPrecondition::AlreadySatisfied`.
+    /// returned [`Precondition::AlreadySatisfied`].
     /// The callback receives the migration version and name.
     pub fn on_migration_skipped<F>(mut self, callback: F) -> Self
     where
@@ -332,7 +159,7 @@ impl MysqlMigrator {
     }
 
     /// Get a reference to all migrations in this migrator.
-    pub fn migrations(&self) -> &[Box<dyn MysqlMigration>] {
+    pub fn migrations(&self) -> &[Box<dyn Migration>] {
         &self.migrations
     }
 
@@ -364,10 +191,7 @@ impl MysqlMigrator {
     /// Get the history of all migrations that have been applied to the database.
     /// Returns migrations in the order they were applied (by version number).
     /// Returns an empty vector if no migrations have been applied.
-    pub fn get_migration_history(
-        &self,
-        conn: &mut Conn,
-    ) -> Result<Vec<MysqlAppliedMigration>, Error> {
+    pub fn get_migration_history(&self, conn: &mut Conn) -> Result<Vec<AppliedMigration>, Error> {
         // Check if schema version table exists
         let table_exists: bool = conn
             .query_first(format!(
@@ -387,14 +211,14 @@ impl MysqlMigrator {
             self.schema_version_table_name
         ))?;
 
-        let migrations: Result<Vec<MysqlAppliedMigration>, Error> = rows
+        let migrations: Result<Vec<AppliedMigration>, Error> = rows
             .into_iter()
             .map(|(version, name, applied_at_str, checksum)| {
                 let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
                     .map_err(|e| Error::Generic(format!("Failed to parse datetime: {}", e)))?
                     .with_timezone(&Utc);
 
-                Ok(MysqlAppliedMigration {
+                Ok(AppliedMigration {
                     version,
                     name,
                     applied_at,
@@ -408,7 +232,7 @@ impl MysqlMigrator {
 
     /// Preview which migrations would be applied by `upgrade()` without actually running them.
     /// Returns a list of migrations that would be executed, in the order they would run.
-    pub fn preview_upgrade(&self, conn: &mut Conn) -> Result<Vec<&Box<dyn MysqlMigration>>, Error> {
+    pub fn preview_upgrade(&self, conn: &mut Conn) -> Result<Vec<&Box<dyn Migration>>, Error> {
         let current_version = self.get_current_version(conn)?;
 
         let mut pending_migrations = self
@@ -427,7 +251,7 @@ impl MysqlMigrator {
         &self,
         conn: &mut Conn,
         target_version: u32,
-    ) -> Result<Vec<&Box<dyn MysqlMigration>>, Error> {
+    ) -> Result<Vec<&Box<dyn Migration>>, Error> {
         let current_version = self.get_current_version(conn)?;
 
         // Validate target version
@@ -456,7 +280,7 @@ impl MysqlMigrator {
         &self,
         conn: &mut Conn,
         target_version: u32,
-    ) -> Result<MysqlMigrationReport<'_>, Error> {
+    ) -> Result<MigrationReport<'_>, Error> {
         // Validate target version exists
         if target_version > 0
             && !self
@@ -474,7 +298,7 @@ impl MysqlMigrator {
     }
 
     /// Upgrade the database by running all pending migrations.
-    pub fn upgrade(&self, conn: &mut Conn) -> Result<MysqlMigrationReport<'_>, Error> {
+    pub fn upgrade(&self, conn: &mut Conn) -> Result<MigrationReport<'_>, Error> {
         self.upgrade_internal(conn, None)
     }
 
@@ -482,7 +306,7 @@ impl MysqlMigrator {
         &self,
         conn: &mut Conn,
         target_version: Option<u32>,
-    ) -> Result<MysqlMigrationReport<'_>, Error> {
+    ) -> Result<MigrationReport<'_>, Error> {
         // Check if schema version tracking table exists
         let schema_version_table_existed: bool = conn
             .query_first(format!(
@@ -605,7 +429,7 @@ impl MysqlMigrator {
             .map(|x| (x.version(), x))
             .collect::<Vec<_>>();
         migrations_sorted.sort_by_key(|m| m.0);
-        let mut failing_migration: Option<MysqlMigrationFailure> = None;
+        let mut failing_migration: Option<MigrationFailure> = None;
         let mut schema_version_table_created = false;
         // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
         let batch_applied_at = Utc::now().to_rfc3339();
@@ -658,7 +482,7 @@ impl MysqlMigrator {
                 let migration_start = Instant::now();
 
                 // Check precondition
-                let precondition = match migration.precondition(conn) {
+                let precondition = match migration.mysql_precondition(conn) {
                     Ok(p) => p,
                     Err(error) => {
                         #[cfg(feature = "tracing")]
@@ -672,14 +496,14 @@ impl MysqlMigrator {
                             callback(migration_version, &migration.name(), &error);
                         }
 
-                        failing_migration = Some(MysqlMigrationFailure { migration, error });
+                        failing_migration = Some(MigrationFailure { migration, error });
                         break;
                     }
                 };
 
                 // Run migration or stamp if precondition is satisfied
                 let migration_result = match precondition {
-                    MysqlPrecondition::AlreadySatisfied => {
+                    Precondition::AlreadySatisfied => {
                         #[cfg(feature = "tracing")]
                         tracing::info!("Precondition already satisfied, stamping migration without running up()");
 
@@ -690,10 +514,10 @@ impl MysqlMigrator {
 
                         Ok(())
                     }
-                    MysqlPrecondition::NeedsApply => {
+                    Precondition::NeedsApply => {
                         // Run the migration directly on the connection
                         // Note: In MySQL, DDL statements cause implicit commits and cannot be rolled back
-                        migration.up(conn)
+                        migration.mysql_up(conn)
                     }
                 };
 
@@ -743,7 +567,7 @@ impl MysqlMigrator {
                         }
 
                         // Transaction will be automatically rolled back when dropped
-                        failing_migration = Some(MysqlMigrationFailure {
+                        failing_migration = Some(MigrationFailure {
                             migration,
                             error: e,
                         });
@@ -760,7 +584,7 @@ impl MysqlMigrator {
             }
         }
         // return report
-        Ok(MysqlMigrationReport {
+        Ok(MigrationReport {
             schema_version_table_existed,
             schema_version_table_created,
             failing_migration,
@@ -771,12 +595,12 @@ impl MysqlMigrator {
     /// Rollback migrations down to the specified target version.
     /// Pass `target_version = 0` to rollback all migrations.
     /// Each migration's `down()` method runs within its own transaction, which is automatically rolled back if it fails.
-    /// Returns a [MysqlMigrationReport] describing which migrations were rolled back.
+    /// Returns a [MigrationReport] describing which migrations were rolled back.
     pub fn downgrade(
         &self,
         conn: &mut Conn,
         target_version: u32,
-    ) -> Result<MysqlMigrationReport<'_>, Error> {
+    ) -> Result<MigrationReport<'_>, Error> {
         // Check if schema version table exists
         let schema_version_table_existed: bool = conn
             .query_first(format!(
@@ -788,7 +612,7 @@ impl MysqlMigrator {
 
         if !schema_version_table_existed {
             // No migrations have been applied yet
-            return Ok(MysqlMigrationReport {
+            return Ok(MigrationReport {
                 schema_version_table_existed: false,
                 schema_version_table_created: false,
                 failing_migration: None,
@@ -899,7 +723,7 @@ impl MysqlMigrator {
         migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.0)); // Reverse order
 
         let mut migrations_run: Vec<u32> = Vec::new();
-        let mut failing_migration: Option<MysqlMigrationFailure> = None;
+        let mut failing_migration: Option<MigrationFailure> = None;
 
         for (migration_version, migration) in migrations_to_rollback {
             #[cfg(feature = "tracing")]
@@ -922,7 +746,7 @@ impl MysqlMigrator {
 
             // Run the downgrade directly on the connection
             // Note: In MySQL, DDL statements cause implicit commits and cannot be rolled back
-            let migration_result = migration.down(conn);
+            let migration_result = migration.mysql_down(conn);
 
             match migration_result {
                 Ok(_) => {
@@ -963,7 +787,7 @@ impl MysqlMigrator {
                         callback(migration_version, &migration.name(), &e);
                     }
 
-                    failing_migration = Some(MysqlMigrationFailure {
+                    failing_migration = Some(MigrationFailure {
                         migration,
                         error: e,
                     });
@@ -972,7 +796,7 @@ impl MysqlMigrator {
             }
         }
 
-        Ok(MysqlMigrationReport {
+        Ok(MigrationReport {
             schema_version_table_existed,
             schema_version_table_created: false,
             failing_migration,
@@ -993,12 +817,16 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1008,7 +836,7 @@ mod tests {
 
         assert_eq!(
             report,
-            MysqlMigrationReport {
+            MigrationReport {
                 schema_version_table_existed: false,
                 schema_version_table_created: true,
                 migrations_run: vec![1],
@@ -1039,7 +867,7 @@ mod tests {
     async fn single_unsuccessful_from_clean() {
         let (_pool, mut conn) = get_test_conn().await;
 
-        // Set up a table and some data
+        // Set up a table and some data to ensure it's preserved
         conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY, value INT)")
             .unwrap();
         conn.query_drop("INSERT INTO test (id, value) VALUES (1, 100)")
@@ -1055,16 +883,20 @@ mod tests {
         assert_eq!(sum, 300);
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
-                // Do some operations
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
+                // Do some DML operations that work (can be rolled back in MySQL)
                 conn.query_drop("UPDATE test SET value = value * 2")?;
                 conn.query_drop("INSERT INTO test (id, value) VALUES (3, 300)")?;
                 // Then do something that fails
                 conn.query_drop("THIS IS NOT VALID SQL")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1076,20 +908,18 @@ mod tests {
         assert_eq!(report.migrations_run, Vec::<u32>::new());
         assert!(report.failing_migration.is_some());
 
-        // IMPORTANT: In MySQL without transactions, the statements that executed successfully
-        // before the failure REMAIN APPLIED. This is the expected behavior - there's no rollback.
-        // The migration version is NOT recorded, allowing you to fix and re-run.
+        // result of migration is NOT rolled back
         let sum: i64 = conn
             .query_first("SELECT SUM(value) FROM test")
             .unwrap()
             .unwrap();
-        assert_eq!(sum, 900); // Changes persisted: (100*2) + (200*2) + 300 + (original 100+200) = 900
+        assert_eq!(sum, 900);
 
         let count: i64 = conn
             .query_first("SELECT COUNT(*) FROM test")
             .unwrap()
             .unwrap();
-        assert_eq!(count, 3); // INSERT succeeded, so we have 3 rows now
+        assert_eq!(count, 3);
     }
 
     #[tokio::test]
@@ -1097,34 +927,46 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE users (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE posts (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration3;
-        impl MysqlMigration for Migration3 {
+        impl Migration for Migration3 {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE comments (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1169,12 +1011,16 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1189,24 +1035,32 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE users (id INT PRIMARY KEY)")?;
                 conn.query_drop("INSERT INTO users VALUES (1), (2)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("INVALID SQL")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1229,11 +1083,15 @@ mod tests {
     #[should_panic(expected = "Migration version must be greater than 0")]
     async fn new_rejects_zero_version() {
         struct Migration0;
-        impl MysqlMigration for Migration0 {
+        impl Migration for Migration0 {
             fn version(&self) -> u32 {
                 0
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1244,31 +1102,43 @@ mod tests {
     #[should_panic(expected = "Duplicate migration version found: 2")]
     async fn new_rejects_duplicate_versions() {
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2a;
-        impl MysqlMigration for Migration2a {
+        impl Migration for Migration2a {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2b;
-        impl MysqlMigration for Migration2b {
+        impl Migration for Migration2b {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1284,21 +1154,29 @@ mod tests {
     #[should_panic(expected = "Migration versions must start at 1")]
     async fn new_rejects_non_starting_at_one() {
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration3;
-        impl MysqlMigration for Migration3 {
+        impl Migration for Migration3 {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1310,21 +1188,29 @@ mod tests {
     #[should_panic(expected = "Migration versions must be contiguous")]
     async fn new_rejects_non_contiguous() {
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration3;
-        impl MysqlMigration for Migration3 {
+        impl Migration for Migration3 {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1335,11 +1221,15 @@ mod tests {
     #[tokio::test]
     async fn try_new_returns_err_for_non_starting_at_one() {
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1354,31 +1244,43 @@ mod tests {
     #[tokio::test]
     async fn try_new_returns_err_for_duplicate_versions() {
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2a;
-        impl MysqlMigration for Migration2a {
+        impl Migration for Migration2a {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2b;
-        impl MysqlMigration for Migration2b {
+        impl Migration for Migration2b {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1395,21 +1297,29 @@ mod tests {
     #[tokio::test]
     async fn try_new_returns_ok_for_valid_migrations() {
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1424,16 +1334,20 @@ mod tests {
 
         // Apply migration with original name
         struct Migration1V1;
-        impl MysqlMigration for Migration1V1 {
+        impl Migration for Migration1V1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "original_name".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -1442,16 +1356,20 @@ mod tests {
 
         // Try to run again with modified name (should fail checksum)
         struct Migration1V2;
-        impl MysqlMigration for Migration1V2 {
+        impl Migration for Migration1V2 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "modified_name".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -1467,30 +1385,38 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "create_test1".to_string()
             }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "create_test2".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -1509,16 +1435,20 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "test_migration".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -1539,16 +1469,20 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("DROP TABLE test")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1580,46 +1514,58 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("DROP TABLE test1")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("DROP TABLE test2")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration3;
-        impl MysqlMigration for Migration3 {
+        impl Migration for Migration3 {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test3 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("DROP TABLE test3")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1646,14 +1592,18 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
-            fn down(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1668,16 +1618,20 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("DROP TABLE test")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1696,12 +1650,16 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1716,11 +1674,15 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1735,23 +1697,31 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1768,21 +1738,29 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1800,33 +1778,45 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration3;
-        impl MysqlMigration for Migration3 {
+        impl Migration for Migration3 {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1853,31 +1843,39 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("DROP TABLE test1")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn down(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_down(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("DROP TABLE test2")?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1896,11 +1894,15 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -1915,30 +1917,38 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "create_test1".to_string()
             }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "create_test2".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -1960,16 +1970,20 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "test_migration".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -2007,15 +2021,19 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Err(Error::Generic("Test error".to_string()))
             }
             fn name(&self) -> String {
                 "failing_migration".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -2059,24 +2077,28 @@ mod tests {
         struct Migration1 {
             up_called: Cell<bool>,
         }
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 self.up_called.set(true);
                 Ok(())
             }
-            fn precondition(&self, conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
+            fn mysql_precondition(&self, conn: &mut Conn) -> Result<Precondition, Error> {
                 // Check if table exists
                 let exists: i64 = conn
                     .query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'test'")?
                     .unwrap();
                 if exists > 0 {
-                    Ok(MysqlPrecondition::AlreadySatisfied)
+                    Ok(Precondition::AlreadySatisfied)
                 } else {
-                    Ok(MysqlPrecondition::NeedsApply)
+                    Ok(Precondition::NeedsApply)
                 }
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -2105,23 +2127,27 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test (id INT PRIMARY KEY)")?;
                 Ok(())
             }
-            fn precondition(&self, conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
+            fn mysql_precondition(&self, conn: &mut Conn) -> Result<Precondition, Error> {
                 let exists: i64 = conn
                     .query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'test'")?
                     .unwrap();
                 if exists > 0 {
-                    Ok(MysqlPrecondition::AlreadySatisfied)
+                    Ok(Precondition::AlreadySatisfied)
                 } else {
-                    Ok(MysqlPrecondition::NeedsApply)
+                    Ok(Precondition::NeedsApply)
                 }
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -2141,15 +2167,19 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Ok(())
             }
-            fn precondition(&self, _conn: &mut Conn) -> Result<MysqlPrecondition, Error> {
+            fn mysql_precondition(&self, _conn: &mut Conn) -> Result<Precondition, Error> {
                 Err(Error::Generic("Precondition check failed".to_string()))
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 
@@ -2166,24 +2196,32 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
                 Err(Error::Generic("Test error".to_string()))
             }
             fn name(&self) -> String {
                 "failing_migration".to_string()
             }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, _conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, _conn: &mut Conn) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
                 Ok(())
             }
         }
@@ -2203,44 +2241,56 @@ mod tests {
         let (_pool, mut conn) = get_test_conn().await;
 
         struct Migration1;
-        impl MysqlMigration for Migration1 {
+        impl Migration for Migration1 {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test1 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "migration_1".to_string()
             }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         struct Migration2;
-        impl MysqlMigration for Migration2 {
+        impl Migration for Migration2 {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test2 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "migration_2".to_string()
             }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         struct Migration3;
-        impl MysqlMigration for Migration3 {
+        impl Migration for Migration3 {
             fn version(&self) -> u32 {
                 3
             }
-            fn up(&self, conn: &mut Conn) -> Result<(), Error> {
+            fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
                 conn.query_drop("CREATE TABLE test3 (id INT PRIMARY KEY)")?;
                 Ok(())
             }
             fn name(&self) -> String {
                 "migration_3".to_string()
+            }
+            #[cfg(feature = "sqlite")]
+            fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+                Ok(())
             }
         }
 

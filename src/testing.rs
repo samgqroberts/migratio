@@ -3,7 +3,7 @@
 //! This module provides a test harness for writing comprehensive migration tests,
 //! including data transformation tests, schema validation, and reversibility checks.
 
-use crate::{Error, SqliteMigrator};
+use crate::{sqlite::SqliteMigrator, Error};
 use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,21 +13,28 @@ use std::collections::HashMap;
 /// # Example
 ///
 /// ```
+/// # #[cfg(not(feature = "sqlite"))]
+/// # fn main() {}
+/// # #[cfg(feature = "sqlite")]
+/// # fn main() {
 /// use migratio::testing::MigrationTestHarness;
-/// use migratio::{Migration, SqliteMigrator, Error};
+/// use migratio::{Migration, Error};
+/// use migratio::sqlite::SqliteMigrator;
 /// use rusqlite::Transaction;
 ///
 /// struct Migration1;
 /// impl Migration for Migration1 {
 ///     fn version(&self) -> u32 { 1 }
-///     fn up(&self, tx: &Transaction) -> Result<(), Error> {
+///     fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
 ///         tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
 ///         Ok(())
 ///     }
-///     fn down(&self, tx: &Transaction) -> Result<(), Error> {
+///     fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
 ///         tx.execute("DROP TABLE users", [])?;
 ///         Ok(())
 ///     }
+/// #   #[cfg(feature = "mysql")]
+/// #   fn mysql_up(&self, tx: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
 /// }
 ///
 /// # fn test() -> Result<(), Error> {
@@ -46,6 +53,7 @@ use std::collections::HashMap;
 /// let name: String = harness.query_one("SELECT name FROM users WHERE id = 1")?;
 /// assert_eq!(name, "alice");
 /// # Ok(())
+/// # }
 /// # }
 /// ```
 pub struct MigrationTestHarness {
@@ -448,7 +456,7 @@ impl MigrationTestHarness {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "mysql")))]
 mod tests {
     use crate::Migration;
 
@@ -460,11 +468,11 @@ mod tests {
         fn version(&self) -> u32 {
             1
         }
-        fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
             tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
             Ok(())
         }
-        fn down(&self, tx: &Transaction) -> Result<(), Error> {
+        fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
             tx.execute("DROP TABLE users", [])?;
             Ok(())
         }
@@ -478,11 +486,11 @@ mod tests {
         fn version(&self) -> u32 {
             2
         }
-        fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
             tx.execute("ALTER TABLE users ADD COLUMN email TEXT", [])?;
             Ok(())
         }
-        fn down(&self, tx: &Transaction) -> Result<(), Error> {
+        fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
             tx.execute(
                 "CREATE TABLE users_temp (id INTEGER PRIMARY KEY, name TEXT)",
                 [],
@@ -502,11 +510,11 @@ mod tests {
         fn version(&self) -> u32 {
             3
         }
-        fn up(&self, tx: &Transaction) -> Result<(), Error> {
+        fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
             tx.execute("CREATE INDEX idx_users_email ON users(email)", [])?;
             Ok(())
         }
-        fn down(&self, tx: &Transaction) -> Result<(), Error> {
+        fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
             tx.execute("DROP INDEX idx_users_email", [])?;
             Ok(())
         }
@@ -888,11 +896,11 @@ mod tests {
             fn version(&self) -> u32 {
                 1
             }
-            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
                 tx.execute("CREATE TABLE prefs (name TEXT PRIMARY KEY, data TEXT)", [])?;
                 Ok(())
             }
-            fn down(&self, tx: &Transaction) -> Result<(), Error> {
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
                 tx.execute("DROP TABLE prefs", [])?;
                 Ok(())
             }
@@ -903,7 +911,7 @@ mod tests {
             fn version(&self) -> u32 {
                 2
             }
-            fn up(&self, tx: &Transaction) -> Result<(), Error> {
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
                 // Transform data from "key:value" to JSON
                 let mut stmt = tx.prepare("SELECT name, data FROM prefs")?;
                 let rows = stmt.query_map([], |row| {
@@ -921,7 +929,7 @@ mod tests {
 
                 Ok(())
             }
-            fn down(&self, _tx: &Transaction) -> Result<(), Error> {
+            fn sqlite_down(&self, _tx: &Transaction) -> Result<(), Error> {
                 // Down not needed for this test
                 Ok(())
             }

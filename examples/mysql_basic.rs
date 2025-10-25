@@ -7,25 +7,25 @@
 // Then run:
 // cargo run --example mysql_basic --features mysql
 
-#[cfg(feature = "mysql")]
+#[cfg(all(feature = "mysql", not(feature = "sqlite")))]
 fn main() {
-    use migratio::{Error, MysqlMigration, MysqlMigrator};
+    use migratio::{Error, Migration, MysqlMigrator};
     use mysql::prelude::*;
-    use mysql::{Conn, OptsBuilder, Transaction};
+    use mysql::{Conn, OptsBuilder};
 
     // Define your migrations as structs that implement the MysqlMigration trait
     struct Migration1;
-    impl MysqlMigration for Migration1 {
+    impl Migration for Migration1 {
         fn version(&self) -> u32 {
             1
         }
-        fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
+        fn mysql_up(&self, tx: &mut Conn) -> Result<(), Error> {
             tx.query_drop(
                 "CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255))",
             )?;
             Ok(())
         }
-        fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
+        fn mysql_down(&self, tx: &mut Conn) -> Result<(), Error> {
             tx.query_drop("DROP TABLE users")?;
             Ok(())
         }
@@ -35,15 +35,15 @@ fn main() {
     }
 
     struct Migration2;
-    impl MysqlMigration for Migration2 {
+    impl Migration for Migration2 {
         fn version(&self) -> u32 {
             2
         }
-        fn up(&self, tx: &mut Transaction) -> Result<(), Error> {
+        fn mysql_up(&self, tx: &mut Conn) -> Result<(), Error> {
             tx.query_drop("ALTER TABLE users ADD COLUMN email VARCHAR(255)")?;
             Ok(())
         }
-        fn down(&self, tx: &mut Transaction) -> Result<(), Error> {
+        fn mysql_down(&self, tx: &mut Conn) -> Result<(), Error> {
             tx.query_drop("ALTER TABLE users DROP COLUMN email")?;
             Ok(())
         }
@@ -114,8 +114,8 @@ fn main() {
     println!("\nExample completed successfully!");
 }
 
-#[cfg(not(feature = "mysql"))]
+#[cfg(any(not(feature = "mysql"), feature = "sqlite"))]
 fn main() {
-    println!("This example requires the 'mysql' feature to be enabled.");
+    println!("This example requires the 'mysql' feature to be enabled (and no other databases).");
     println!("Run with: cargo run --example mysql_basic --features mysql");
 }
