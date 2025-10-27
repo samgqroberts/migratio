@@ -1,6 +1,6 @@
-//! MySQL testing utilities.
+//! Testing utilities for MySQL migration development.
 //!
-//! This module provides a test harness for MySQL migration testing.
+//! This module provides a test harness for MySQL migration testing: [MysqlTestHarness]
 
 use crate::{mysql::MysqlMigrator, Error};
 use mysql::prelude::*;

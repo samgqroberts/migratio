@@ -1,3 +1,7 @@
+//!
+//! # MySQL migration support
+//!
+
 use crate::core::DEFAULT_VERSION_TABLE_NAME;
 use crate::error::Error;
 use crate::AppliedMigration;

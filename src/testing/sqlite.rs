@@ -1,7 +1,6 @@
-//! Testing utilities for migration development and verification for SQLite.
+//! Testing utilities for SQLite migration development.
 //!
-//! This module provides test harnesses for writing comprehensive migration tests,
-//! including data transformation tests, schema validation, and reversibility checks.
+//! This module provides a test harness for MySQL migration testing: [SqliteTestHarness]
 
 use crate::{sqlite::SqliteMigrator, Error};
 use rusqlite::{Connection, Row};

@@ -1,5 +1,7 @@
 //!
-//! # Example
+//! # SQLite migration support
+//!
+//! ## Example
 //!
 //! ```
 //! use migratio::{Migration, MigrationReport, Error};

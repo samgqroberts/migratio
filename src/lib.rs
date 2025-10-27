@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+// TODO rerun cargo readme-doc
 //! `migratio` is a lightweight library for managing database migrations.
 //!
 //! Core concepts:
@@ -22,20 +24,21 @@
 //! A central use case for `migratio` is embedding migration logic within an application, usually in the startup procedure.
 //! This way, when the application updates, the next time it starts the database will automatically be migrated to the latest version without any manual intervention.
 //!
-//! Anywhere you can construct a [sqlite::SqliteMigrator] or [mysql::MysqlMigrator] instance, you can access any feature this library provides.
+//! Anywhere you can construct a [SqliteMigrator](sqlite::SqliteMigrator) or [MysqlMigrator](mysql::MysqlMigrator) instance, you can access any feature this library provides.
 //!
-//! # Features:
-//! - Easy adoption from other migration tools, or no migration tool.
+//! # Benefits
+//! - Easy adoption from other migration tools or no migration tool.
 //! - Robust error handling and rollback support (when available).
 //! - Preview / dry-run support.
 //! - Migration history querying.
 //! - Observability hooks.
-//! - Tracing integration.
-//! - Feature-rich testing utilities.
+//! - Tracing integration = available with the `tracing` feature flag.
+//! - Testing utilities - available with the `testing` feature flag.
 //!
-//! Database support:
-//! - [`SQLite`](sqlite)
-//! - [`MySQL`](mysql)
+//! # Database support
+//!
+//! - [`SQLite`](sqlite) - available with the `sqlite` feature flag.
+//! - [`MySQL`](mysql) - available with the `mysql` feature flag.
 
 mod core;
 pub use core::{AppliedMigration, Migration, MigrationFailure, MigrationReport, Precondition};

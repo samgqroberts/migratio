@@ -2,13 +2,13 @@
 name = "migratio"
 version = "0.2.0"
 edition = "2021"
-description = "Write DB migrations in Rust (similar to Alembic), currently for SQLite."
+description = "Write expressive database migrations in Rust."
 license = "MIT"   # SPDX ID(s)
 readme = "README.md"
 repository = "https://github.com/samgqroberts/migratio"
 homepage = "https://github.com/samgqroberts/migratio"
 documentation = "https://docs.rs/migratio"
-keywords = ["database", "migration", "sqlite"]
+keywords = ["database", "migration", "sqlite", "mysql"]
 categories = ["database", "development-tools"]
 authors = ["Sam Roberts <samgqroberts@gmail.com>"]
 include = ["/src", "LICENSE"]
@@ -36,10 +36,16 @@ uuid = { version = "1.18.1", features = ["v4"] }
 
 [features]
 default = []
+
+## Enables SQLite migration support
 sqlite = ["dep:rusqlite"]
+## Enables MySQL migration support
 mysql = ["dep:mysql"]
+## Enables tracing calls from within the library
 tracing = ["dep:tracing"]
+## Provides testing utilities
 testing = ["sqlite"]
 
 [package.metadata.docs.rs]
-all_features = true
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
