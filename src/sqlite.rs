@@ -871,43 +871,20 @@
 //!
 
 use crate::{
-    core::DEFAULT_VERSION_TABLE_NAME, error::Error, AppliedMigration, Migration, MigrationFailure,
+    core::GenericMigrator, error::Error, AppliedMigration, Migration, MigrationFailure,
     MigrationReport, Precondition,
 };
 use chrono::Utc;
 use rusqlite::{params, Connection};
-use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 /// The entrypoint for running a sequence of [Migration]s.
 /// Construct this struct with the list of all [Migration]s to be applied.
 /// [Migration::version]s must be contiguous, greater than zero, and unique.
+#[derive(Debug)]
 pub struct SqliteMigrator {
-    migrations: Vec<Box<dyn Migration>>,
-    schema_version_table_name: String,
+    migrator: GenericMigrator,
     busy_timeout: std::time::Duration,
-    on_migration_start: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
-    on_migration_complete: Option<Box<dyn Fn(u32, &str, std::time::Duration) + Send + Sync>>,
-    on_migration_skipped: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
-    on_migration_error: Option<Box<dyn Fn(u32, &str, &Error) + Send + Sync>>,
-}
-
-// Manual Debug impl since closures don't implement Debug
-impl std::fmt::Debug for SqliteMigrator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SqliteMigrator")
-            .field("migrations", &self.migrations)
-            .field("schema_version_table_name", &self.schema_version_table_name)
-            .field("busy_timeout", &self.busy_timeout)
-            .field("on_migration_start", &self.on_migration_start.is_some())
-            .field(
-                "on_migration_complete",
-                &self.on_migration_complete.is_some(),
-            )
-            .field("on_migration_skipped", &self.on_migration_skipped.is_some())
-            .field("on_migration_error", &self.on_migration_error.is_some())
-            .finish()
-    }
 }
 
 impl SqliteMigrator {
@@ -920,64 +897,12 @@ impl SqliteMigrator {
         Ok(())
     }
 
-    /// Calculate a checksum for a migration based on its version and name.
-    /// This is used to verify that migrations haven't been modified after being applied.
-    fn calculate_checksum(migration: &Box<dyn Migration>) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(migration.version().to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(migration.name().as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
     /// Create a new SqliteMigrator, validating migration invariants.
     /// Returns an error if migrations are invalid.
     pub fn try_new(migrations: Vec<Box<dyn Migration>>) -> Result<Self, String> {
-        // Verify invariants
-        let mut versions: Vec<u32> = migrations.iter().map(|m| m.version()).collect();
-        versions.sort();
-
-        // Check for duplicates and zero versions
-        for (i, &version) in versions.iter().enumerate() {
-            // Version must be greater than zero
-            if version == 0 {
-                return Err("Migration version must be greater than 0, found version 0".to_string());
-            }
-
-            // Check for duplicates
-            if i > 0 && versions[i - 1] == version {
-                return Err(format!("Duplicate migration version found: {}", version));
-            }
-        }
-
-        // Check for contiguity (versions must be 1, 2, 3, ...)
-        if !versions.is_empty() {
-            if versions[0] != 1 {
-                return Err(format!(
-                    "Migration versions must start at 1, found starting version: {}",
-                    versions[0]
-                ));
-            }
-
-            for (i, &version) in versions.iter().enumerate() {
-                let expected = (i + 1) as u32;
-                if version != expected {
-                    return Err(format!(
-                        "Migration versions must be contiguous. Expected version {}, found {}",
-                        expected, version
-                    ));
-                }
-            }
-        }
-
         Ok(Self {
-            migrations,
-            schema_version_table_name: DEFAULT_VERSION_TABLE_NAME.to_string(),
+            migrator: GenericMigrator::try_new(migrations)?,
             busy_timeout: std::time::Duration::from_secs(30),
-            on_migration_start: None,
-            on_migration_complete: None,
-            on_migration_skipped: None,
-            on_migration_error: None,
         })
     }
 
@@ -993,7 +918,7 @@ impl SqliteMigrator {
     /// Set a custom name for the schema version tracking table.
     /// Defaults to "_migratio_version_".
     pub fn with_schema_version_table_name(mut self, name: impl Into<String>) -> Self {
-        self.schema_version_table_name = name.into();
+        self.migrator.set_schema_version_table_name(name);
         self
     }
 
@@ -1031,7 +956,7 @@ impl SqliteMigrator {
     where
         F: Fn(u32, &str) + Send + Sync + 'static,
     {
-        self.on_migration_start = Some(Box::new(callback));
+        self.migrator.set_on_migration_start(callback);
         self
     }
 
@@ -1061,7 +986,7 @@ impl SqliteMigrator {
     where
         F: Fn(u32, &str, std::time::Duration) + Send + Sync + 'static,
     {
-        self.on_migration_complete = Some(Box::new(callback));
+        self.migrator.set_on_migration_complete(callback);
         self
     }
 
@@ -1092,7 +1017,7 @@ impl SqliteMigrator {
     where
         F: Fn(u32, &str) + Send + Sync + 'static,
     {
-        self.on_migration_skipped = Some(Box::new(callback));
+        self.migrator.set_on_migration_skipped(callback);
         self
     }
 
@@ -1122,13 +1047,17 @@ impl SqliteMigrator {
     where
         F: Fn(u32, &str, &Error) + Send + Sync + 'static,
     {
-        self.on_migration_error = Some(Box::new(callback));
+        self.migrator.set_on_migration_error(callback);
         self
     }
 
     /// Get a reference to all migrations in this migrator.
     pub fn migrations(&self) -> &[Box<dyn Migration>] {
-        &self.migrations
+        &self.migrator.migrations
+    }
+
+    pub fn schema_version_table_name(&self) -> &str {
+        &self.migrator.schema_version_table_name
     }
 
     /// Get the current migration version from the database.
@@ -1138,7 +1067,7 @@ impl SqliteMigrator {
         let mut stmt =
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
         let table_exists = stmt
-            .query([&self.schema_version_table_name])?
+            .query([&self.schema_version_table_name()])?
             .next()?
             .is_some();
 
@@ -1149,7 +1078,7 @@ impl SqliteMigrator {
         // Get current version (highest version number)
         let mut stmt = conn.prepare(&format!(
             "SELECT MAX(version) from {}",
-            self.schema_version_table_name
+            self.schema_version_table_name()
         ))?;
         let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
         Ok(version.unwrap_or(0))
@@ -1166,7 +1095,7 @@ impl SqliteMigrator {
         let mut stmt =
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
         let table_exists = stmt
-            .query([&self.schema_version_table_name])?
+            .query([&self.schema_version_table_name()])?
             .next()?
             .is_some();
 
@@ -1177,7 +1106,7 @@ impl SqliteMigrator {
         // Query all applied migrations, ordered by version
         let mut stmt = conn.prepare(&format!(
             "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
-            self.schema_version_table_name
+            self.schema_version_table_name()
         ))?;
 
         let migrations = stmt
@@ -1214,7 +1143,7 @@ impl SqliteMigrator {
         let current_version = self.get_current_version(conn)?;
 
         let mut pending_migrations = self
-            .migrations
+            .migrations()
             .iter()
             .filter(|m| m.version() > current_version)
             .collect::<Vec<_>>();
@@ -1243,7 +1172,7 @@ impl SqliteMigrator {
         }
 
         let mut migrations_to_rollback = self
-            .migrations
+            .migrations()
             .iter()
             .filter(|m| m.version() > target_version && m.version() <= current_version)
             .collect::<Vec<_>>();
@@ -1267,7 +1196,7 @@ impl SqliteMigrator {
         // Validate target version exists
         if target_version > 0
             && !self
-                .migrations
+                .migrations()
                 .iter()
                 .any(|m| m.version() == target_version)
         {
@@ -1299,7 +1228,7 @@ impl SqliteMigrator {
             let mut stmt =
                 conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
             let schema_version_table_existed = stmt
-                .query([&self.schema_version_table_name])?
+                .query([&self.schema_version_table_name()])?
                 .next()?
                 .is_some();
             if !schema_version_table_existed {
@@ -1308,7 +1237,7 @@ impl SqliteMigrator {
                 conn.execute(
                 &format!(
                     "CREATE TABLE IF NOT EXISTS {} (version integer primary key not null, name text not null, applied_at text not null, checksum text not null)",
-                    self.schema_version_table_name
+                    self.schema_version_table_name()
                 ),
                 [],)?;
             }
@@ -1321,7 +1250,7 @@ impl SqliteMigrator {
             let has_checksum_column = {
                 let mut stmt = conn.prepare(&format!(
                     "PRAGMA table_info({})",
-                    self.schema_version_table_name
+                    self.schema_version_table_name()
                 ))?;
                 let columns: Vec<String> = stmt
                     .query_map([], |row| row.get::<_, String>(1))?
@@ -1333,7 +1262,7 @@ impl SqliteMigrator {
                 // Get all applied migrations with their checksums
                 let mut stmt = conn.prepare(&format!(
                     "SELECT version, name, checksum FROM {}",
-                    self.schema_version_table_name
+                    self.schema_version_table_name()
                 ))?;
                 let applied_migrations: Vec<(u32, String, String)> = stmt
                     .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
@@ -1343,11 +1272,11 @@ impl SqliteMigrator {
                 // Also detect missing migrations (in DB but not in code)
                 for (applied_version, applied_name, applied_checksum) in &applied_migrations {
                     if let Some(migration) = self
-                        .migrations
+                        .migrations()
                         .iter()
                         .find(|m| m.version() == *applied_version)
                     {
-                        let current_checksum = Self::calculate_checksum(migration);
+                        let current_checksum = GenericMigrator::calculate_checksum(migration);
                         if current_checksum != *applied_checksum {
                             return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
                                 format!(
@@ -1388,7 +1317,7 @@ impl SqliteMigrator {
                         if !applied_versions.contains(&expected_version) {
                             // There's a gap - check if this migration exists in our code
                             if let Some(missing_migration) = self
-                                .migrations
+                                .migrations()
                                 .iter()
                                 .find(|m| m.version() == expected_version)
                             {
@@ -1415,7 +1344,7 @@ impl SqliteMigrator {
         let current_version: u32 = {
             let mut stmt = conn.prepare(&format!(
                 "SELECT MAX(version) from {}",
-                self.schema_version_table_name
+                self.schema_version_table_name()
             ))?;
             let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
             version.unwrap_or(0)
@@ -1423,7 +1352,7 @@ impl SqliteMigrator {
         // iterate through migrations, run those that haven't been run
         let mut migrations_run: Vec<u32> = Vec::new();
         let mut migrations_sorted = self
-            .migrations
+            .migrations()
             .iter()
             .map(|x| (x.version(), x))
             .collect::<Vec<_>>();
@@ -1474,7 +1403,7 @@ impl SqliteMigrator {
                 tracing::info!("Starting migration");
 
                 // Call on_migration_start hook
-                if let Some(ref callback) = self.on_migration_start {
+                if let Some(ref callback) = self.migrator.on_migration_start {
                     callback(migration_version, &migration.name());
                 }
 
@@ -1497,7 +1426,7 @@ impl SqliteMigrator {
                             );
 
                             // Call on_migration_error hook
-                            if let Some(ref callback) = self.on_migration_error {
+                            if let Some(ref callback) = self.migrator.on_migration_error {
                                 callback(migration_version, &migration.name(), &error);
                             }
 
@@ -1513,7 +1442,7 @@ impl SqliteMigrator {
                             tracing::info!("Precondition already satisfied, stamping migration without running up()");
 
                             // Call on_migration_skipped hook
-                            if let Some(ref callback) = self.on_migration_skipped {
+                            if let Some(ref callback) = self.migrator.on_migration_skipped {
                                 callback(migration_version, &migration.name());
                             }
 
@@ -1543,13 +1472,13 @@ impl SqliteMigrator {
                         );
 
                         // Calculate checksum for this migration
-                        let checksum = Self::calculate_checksum(migration);
+                        let checksum = GenericMigrator::calculate_checksum(migration);
 
                         // Insert a row for this migration with its name, timestamp, and checksum
                         conn.execute(
                             &format!(
                                 "INSERT INTO {} (version, name, applied_at, checksum) VALUES(?1, ?2, ?3, ?4)",
-                                self.schema_version_table_name
+                                self.schema_version_table_name()
                             ),
                             params![migration_version, migration.name(), &batch_applied_at, checksum],
                         )?;
@@ -1561,7 +1490,7 @@ impl SqliteMigrator {
                         schema_version_table_created = true;
 
                         // Call on_migration_complete hook
-                        if let Some(ref callback) = self.on_migration_complete {
+                        if let Some(ref callback) = self.migrator.on_migration_complete {
                             callback(migration_version, &migration.name(), migration_duration);
                         }
                     }
@@ -1573,7 +1502,7 @@ impl SqliteMigrator {
                         );
 
                         // Call on_migration_error hook
-                        if let Some(ref callback) = self.on_migration_error {
+                        if let Some(ref callback) = self.migrator.on_migration_error {
                             callback(migration_version, &migration.name(), &e);
                         }
 
@@ -1620,7 +1549,7 @@ impl SqliteMigrator {
             let mut stmt =
                 conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
             let exists = stmt
-                .query([&self.schema_version_table_name])?
+                .query([self.schema_version_table_name()])?
                 .next()?
                 .is_some();
             exists
@@ -1640,7 +1569,7 @@ impl SqliteMigrator {
         let has_checksum_column = {
             let mut stmt = conn.prepare(&format!(
                 "PRAGMA table_info({})",
-                self.schema_version_table_name
+                self.schema_version_table_name()
             ))?;
             let columns: Vec<String> = stmt
                 .query_map([], |row| row.get::<_, String>(1))?
@@ -1651,7 +1580,7 @@ impl SqliteMigrator {
         if has_checksum_column {
             let mut stmt = conn.prepare(&format!(
                 "SELECT version, name, checksum FROM {}",
-                self.schema_version_table_name
+                self.schema_version_table_name()
             ))?;
             let applied_migrations: Vec<(u32, String, String)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
@@ -1660,11 +1589,11 @@ impl SqliteMigrator {
             // Verify checksums and detect missing migrations
             for (applied_version, applied_name, applied_checksum) in &applied_migrations {
                 if let Some(migration) = self
-                    .migrations
+                    .migrations()
                     .iter()
                     .find(|m| m.version() == *applied_version)
                 {
-                    let current_checksum = Self::calculate_checksum(migration);
+                    let current_checksum = GenericMigrator::calculate_checksum(migration);
                     if current_checksum != *applied_checksum {
                         return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
                             format!(
@@ -1701,7 +1630,7 @@ impl SqliteMigrator {
                 for expected_version in 1..=max_applied {
                     if !applied_versions.contains(&expected_version) {
                         if let Some(missing_migration) = self
-                            .migrations
+                            .migrations()
                             .iter()
                             .find(|m| m.version() == expected_version)
                         {
@@ -1727,7 +1656,7 @@ impl SqliteMigrator {
         let current_version: u32 = {
             let mut stmt = conn.prepare(&format!(
                 "SELECT MAX(version) from {}",
-                self.schema_version_table_name
+                self.schema_version_table_name()
             ))?;
             let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
             version.unwrap_or(0)
@@ -1745,7 +1674,7 @@ impl SqliteMigrator {
 
         // Get migrations to rollback (in reverse order)
         let mut migrations_to_rollback = self
-            .migrations
+            .migrations()
             .iter()
             .filter(|m| m.version() > target_version && m.version() <= current_version)
             .map(|x| (x.version(), x))
@@ -1768,7 +1697,7 @@ impl SqliteMigrator {
             tracing::info!("Rolling back migration");
 
             // Call on_migration_start hook
-            if let Some(ref callback) = self.on_migration_start {
+            if let Some(ref callback) = self.migrator.on_migration_start {
                 callback(migration_version, &migration.name());
             }
 
@@ -1795,7 +1724,7 @@ impl SqliteMigrator {
                     conn.execute(
                         &format!(
                             "DELETE FROM {} WHERE version = ?1",
-                            self.schema_version_table_name
+                            self.schema_version_table_name()
                         ),
                         params![migration_version],
                     )?;
@@ -1804,7 +1733,7 @@ impl SqliteMigrator {
                     migrations_run.push(migration_version);
 
                     // Call on_migration_complete hook
-                    if let Some(ref callback) = self.on_migration_complete {
+                    if let Some(ref callback) = self.migrator.on_migration_complete {
                         callback(migration_version, &migration.name(), migration_duration);
                     }
                 }
@@ -1816,7 +1745,7 @@ impl SqliteMigrator {
                     );
 
                     // Call on_migration_error hook
-                    if let Some(ref callback) = self.on_migration_error {
+                    if let Some(ref callback) = self.migrator.on_migration_error {
                         callback(migration_version, &migration.name(), &e);
                     }
 
@@ -2925,7 +2854,7 @@ mod tests {
 
         // Verify it matches the calculated checksum
         let migration = Box::new(Migration1) as Box<dyn Migration>;
-        let expected_checksum = SqliteMigrator::calculate_checksum(&migration);
+        let expected_checksum = GenericMigrator::calculate_checksum(&migration);
         assert_eq!(checksum, expected_checksum);
     }
 
@@ -3967,7 +3896,7 @@ mod tests {
 
         // Verify checksum matches what would be calculated
         let migration = Box::new(Migration1) as Box<dyn Migration>;
-        let expected_checksum = SqliteMigrator::calculate_checksum(&migration);
+        let expected_checksum = GenericMigrator::calculate_checksum(&migration);
         assert_eq!(history[0].checksum, expected_checksum);
     }
 
@@ -4423,7 +4352,7 @@ mod tests {
         // Manually insert migration 3 into the database to simulate it being applied
         let checksum = {
             let migration = Box::new(Migration3) as Box<dyn Migration>;
-            SqliteMigrator::calculate_checksum(&migration)
+            GenericMigrator::calculate_checksum(&migration)
         };
         conn.execute(
             "INSERT INTO _migratio_version_ (version, name, applied_at, checksum) VALUES (3, 'create_test3', datetime('now'), ?1)",

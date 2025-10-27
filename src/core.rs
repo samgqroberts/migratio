@@ -1,5 +1,6 @@
 use crate::error::Error;
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 
 /// Represents a failure during a migration.
 #[derive(Debug, PartialEq)]
@@ -242,5 +243,133 @@ impl std::fmt::Debug for dyn Migration {
             .field("version", &self.version())
             .field("name", &self.name())
             .finish()
+    }
+}
+
+/// Shared migrator logic between different database types.
+pub(crate) struct GenericMigrator {
+    pub migrations: Vec<Box<dyn Migration>>,
+    pub schema_version_table_name: String,
+    pub on_migration_start: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
+    pub on_migration_complete: Option<Box<dyn Fn(u32, &str, std::time::Duration) + Send + Sync>>,
+    pub on_migration_skipped: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
+    pub on_migration_error: Option<Box<dyn Fn(u32, &str, &Error) + Send + Sync>>,
+}
+
+// Manual Debug impl since closures don't implement Debug
+impl std::fmt::Debug for GenericMigrator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenericMigrator")
+            .field("migrations", &self.migrations)
+            .field("schema_version_table_name", &self.schema_version_table_name)
+            .field("on_migration_start", &self.on_migration_start.is_some())
+            .field(
+                "on_migration_complete",
+                &self.on_migration_complete.is_some(),
+            )
+            .field("on_migration_skipped", &self.on_migration_skipped.is_some())
+            .field("on_migration_error", &self.on_migration_error.is_some())
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+impl GenericMigrator {
+    /// Create a new MysqlMigrator, validating migration invariants.
+    /// Returns an error if migrations are invalid.
+    pub fn try_new(migrations: Vec<Box<dyn Migration>>) -> Result<Self, String> {
+        // Verify invariants
+        let mut versions: Vec<u32> = migrations.iter().map(|m| m.version()).collect();
+        versions.sort();
+
+        // Check for duplicates and zero versions
+        for (i, &version) in versions.iter().enumerate() {
+            // Version must be greater than zero
+            if version == 0 {
+                return Err("Migration version must be greater than 0, found version 0".to_string());
+            }
+
+            // Check for duplicates
+            if i > 0 && versions[i - 1] == version {
+                return Err(format!("Duplicate migration version found: {}", version));
+            }
+        }
+
+        // Check for contiguity (versions must be 1, 2, 3, ...)
+        if !versions.is_empty() {
+            if versions[0] != 1 {
+                return Err(format!(
+                    "Migration versions must start at 1, found starting version: {}",
+                    versions[0]
+                ));
+            }
+
+            for (i, &version) in versions.iter().enumerate() {
+                let expected = (i + 1) as u32;
+                if version != expected {
+                    return Err(format!(
+                        "Migration versions must be contiguous. Expected version {}, found {}",
+                        expected, version
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            migrations,
+            schema_version_table_name: DEFAULT_VERSION_TABLE_NAME.to_string(),
+            on_migration_start: None,
+            on_migration_complete: None,
+            on_migration_skipped: None,
+            on_migration_error: None,
+        })
+    }
+
+    /// Set a custom name for the schema version tracking table.
+    /// Defaults to "_migratio_version_".
+    pub fn set_schema_version_table_name(&mut self, name: impl Into<String>) -> () {
+        self.schema_version_table_name = name.into();
+    }
+
+    pub fn set_on_migration_start(
+        &mut self,
+        callback: impl Fn(u32, &str) + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.on_migration_start = Some(Box::new(callback));
+        self
+    }
+
+    pub fn set_on_migration_complete(
+        &mut self,
+        callback: impl Fn(u32, &str, std::time::Duration) + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.on_migration_complete = Some(Box::new(callback));
+        self
+    }
+
+    pub fn set_on_migration_skipped(
+        &mut self,
+        callback: impl Fn(u32, &str) + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.on_migration_skipped = Some(Box::new(callback));
+        self
+    }
+
+    pub fn set_on_migration_error(
+        &mut self,
+        callback: impl Fn(u32, &str, &Error) + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.on_migration_error = Some(Box::new(callback));
+        self
+    }
+
+    /// Calculate a checksum for a migration based on its version and name.
+    /// This is used to verify that migrations haven't been modified after being applied.
+    pub fn calculate_checksum(migration: &Box<dyn Migration>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(migration.version().to_string().as_bytes());
+        hasher.update(b"|");
+        hasher.update(migration.name().as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 }
