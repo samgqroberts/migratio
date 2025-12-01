@@ -705,7 +705,8 @@
 //!
 //! // Verify the exact captured tracing output
 //! let output = String::from_utf8(events.lock().unwrap().clone()).unwrap();
-//! assert_eq!(output, r#" INFO migration_up{version=1 name=create_users}: Starting migration
+//! assert_eq!(output, r#" INFO Creating migration tracking table: _migratio_version_
+//!  INFO migration_up{version=1 name=create_users}: Starting migration
 //!  INFO migration_up{version=1 name=create_users}: Migration completed successfully duration_ms=0
 //! "#);
 //! # }
@@ -899,6 +900,7 @@ impl SqliteMigrator {
 
     /// Create a new SqliteMigrator, validating migration invariants.
     /// Returns an error if migrations are invalid.
+    // TODO can this be const?
     pub fn try_new(migrations: Vec<Box<dyn Migration>>) -> Result<Self, String> {
         Ok(Self {
             migrator: GenericMigrator::try_new(migrations)?,
@@ -1232,6 +1234,11 @@ impl SqliteMigrator {
                 .next()?
                 .is_some();
             if !schema_version_table_existed {
+                #[cfg(feature = "tracing")]
+                tracing::info!(
+                    "Creating migration tracking table: {}",
+                    self.schema_version_table_name()
+                );
                 // create table with name and checksum columns
                 // Use IF NOT EXISTS to handle concurrent creation attempts
                 conn.execute(
@@ -1240,6 +1247,13 @@ impl SqliteMigrator {
                     self.schema_version_table_name()
                 ),
                 [],)?;
+            }
+            #[cfg(feature = "tracing")]
+            if schema_version_table_existed {
+                tracing::debug!(
+                    "Migration tracking table '{}' exists",
+                    self.schema_version_table_name()
+                );
             }
             schema_version_table_existed
         };

@@ -1,6 +1,6 @@
 [package]
 name = "migratio"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Write expressive database migrations in Rust."
 license = "MIT"   # SPDX ID(s)
@@ -44,7 +44,7 @@ mysql = ["dep:mysql"]
 ## Enables tracing calls from within the library
 tracing = ["dep:tracing"]
 ## Provides testing utilities
-testing = ["sqlite"]
+testing = []
 
 [package.metadata.docs.rs]
 all-features = true
