@@ -6,10 +6,18 @@
 use std::fs;
 use std::process::Command;
 
-use cargo_metadata::camino;
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::camino::{self, Utf8PathBuf};
+use cargo_metadata::{Metadata, MetadataCommand, Package};
 use clap::Parser;
 use serde::Deserialize;
+
+/// Where to get migratio-cli from
+enum MigratioCliSource {
+    /// Use crates.io with specified version
+    CratesIo(String),
+    /// Use a local path (when user has path dependency on migratio)
+    Path(Utf8PathBuf),
+}
 
 #[derive(Parser)]
 #[command(name = "cargo")]
@@ -85,6 +93,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .ok_or("Could not determine package directory")?;
 
+    // Check if the user's migratio dependency is a path dependency
+    // If so, we need to use the local migratio-cli as well to avoid version conflicts
+    let migratio_cli_source = find_migratio_cli_source(&metadata, root_package);
+
     // Create runner directory
     let runner_dir = metadata.target_directory.join("migratio-runner");
     fs::create_dir_all(&runner_dir)?;
@@ -94,8 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runner_cargo_toml = generate_runner_cargo_toml(
         &root_package.name,
         package_dir,
-        &metadata.workspace_root,
         &config,
+        &migratio_cli_source,
     );
     fs::write(runner_dir.join("Cargo.toml"), runner_cargo_toml)?;
 
@@ -171,11 +183,37 @@ fn print_help() {
     println!("  -h, --help  Print help");
 }
 
+/// Find the migratio package in the dependency graph and check if it's a path dependency.
+/// If it is, return the path to migratio-cli (sibling directory).
+/// Otherwise, return the version to use from crates.io.
+fn find_migratio_cli_source(metadata: &Metadata, root_package: &Package) -> MigratioCliSource {
+    // Look for 'migratio' in the resolved packages
+    for package in &metadata.packages {
+        if package.name == "migratio" {
+            // Check if any of the root package's dependencies point to this migratio via path
+            for dep in &root_package.dependencies {
+                if dep.name == "migratio" {
+                    if let Some(path) = &dep.path {
+                        // It's a path dependency - migratio-cli should be a sibling
+                        let migratio_cli_path = path.parent().unwrap().join("migratio-cli");
+                        if migratio_cli_path.exists() {
+                            return MigratioCliSource::Path(migratio_cli_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Default to crates.io with the same version as this binary
+    MigratioCliSource::CratesIo(env!("CARGO_PKG_VERSION").to_string())
+}
+
 fn generate_runner_cargo_toml(
     package_name: &str,
     package_dir: &camino::Utf8Path,
-    workspace_root: &camino::Utf8Path,
     config: &MigratioConfig,
+    migratio_cli_source: &MigratioCliSource,
 ) -> String {
     let feature = match config.database.as_str() {
         "sqlite" => "sqlite",
@@ -188,6 +226,21 @@ fn generate_runner_cargo_toml(
         String::new()
     } else {
         format!(", features = {:?}", config.features)
+    };
+
+    let migratio_cli_dep = match migratio_cli_source {
+        MigratioCliSource::CratesIo(version) => {
+            format!(
+                "migratio-cli = {{ version = \"{}\", features = [\"{}\"] }}",
+                version, feature
+            )
+        }
+        MigratioCliSource::Path(path) => {
+            format!(
+                "migratio-cli = {{ path = \"{}\", features = [\"{}\"] }}",
+                path, feature
+            )
+        }
     };
 
     format!(
@@ -206,14 +259,13 @@ path = "src/main.rs"
 
 [dependencies]
 {package_name} = {{ path = "{package_dir}"{user_features} }}
-migratio-cli = {{ path = "{workspace_root}/migratio-cli", features = ["{feature}"] }}
+{migratio_cli_dep}
 clap = {{ version = "4", features = ["derive"] }}
 "#,
         package_name = package_name,
         package_dir = package_dir,
-        workspace_root = workspace_root,
         user_features = user_features,
-        feature = feature,
+        migratio_cli_dep = migratio_cli_dep,
     )
 }
 

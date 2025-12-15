@@ -98,14 +98,21 @@ pub trait Migration {
     }
 
     #[cfg(feature = "sqlite")]
-    fn sqlite_up(&self, tx: &rusqlite::Transaction) -> Result<(), Error>;
+    /// Execute the migration's "up" logic for SQLite.
+    fn sqlite_up(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
+        panic!(
+            "Migration {} ('{}') does not implement sqlite_up(). Implement this method to use SQLite.",
+            self.version(),
+            self.name()
+        )
+    }
 
     #[cfg(feature = "sqlite")]
     /// Rollback this migration. This is optional - the default implementation panics.
     /// If you want to support downgrade functionality, implement this method.
     fn sqlite_down(&self, _tx: &rusqlite::Transaction) -> Result<(), Error> {
         panic!(
-            "Migration {} ('{}') does not support downgrade. Implement the down() method to enable rollback.",
+            "Migration {} ('{}') does not support downgrade. Implement the sqlite_down() method to enable rollback.",
             self.version(),
             self.name()
         )
@@ -195,7 +202,13 @@ pub trait Migration {
     ///     Ok(())
     /// }
     /// ```
-    fn mysql_up(&self, conn: &mut mysql::Conn) -> Result<(), Error>;
+    fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+        panic!(
+            "Migration {} ('{}') does not implement mysql_up(). Implement this method to use MySQL.",
+            self.version(),
+            self.name()
+        )
+    }
 
     #[cfg(feature = "mysql")]
     /// Rollback this migration. This is optional - the default implementation panics.
@@ -207,7 +220,7 @@ pub trait Migration {
     /// will be committed immediately.
     fn mysql_down(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
         panic!(
-            "Migration {} ('{}') does not support downgrade. Implement the down() method to enable rollback.",
+            "Migration {} ('{}') does not support downgrade. Implement the mysql_down() method to enable rollback.",
             self.version(),
             self.name()
         )
