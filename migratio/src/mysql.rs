@@ -10,9 +10,13 @@ use crate::MigrationFailure;
 use crate::MigrationReport;
 use crate::Precondition;
 use chrono::Utc;
-use mysql::prelude::*;
+use mysql::prelude::Queryable;
 use mysql::Conn;
 use std::time::Instant;
+
+// Re-export mysql types for use in migrations
+pub use mysql::prelude::Queryable as MysqlQueryable;
+pub use mysql::Conn as MysqlConn;
 
 /// The entrypoint for running a sequence of [Migration]s on a MySQL database.
 /// Construct this struct with the list of all [Migration]s to be applied.
