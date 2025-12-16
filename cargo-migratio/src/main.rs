@@ -201,7 +201,7 @@ fn print_help() {
 
 /// Find the migratio package in the dependency graph and check if it's a path dependency.
 /// If it is, return the path to migratio-cli (sibling directory).
-/// Otherwise, return the version to use from crates.io.
+/// Otherwise, return the version of migratio the user is using for migratio-cli.
 fn find_migratio_cli_source(metadata: &Metadata, root_package: &Package) -> MigratioCliSource {
     // Look for 'migratio' in the resolved packages
     for package in &metadata.packages {
@@ -218,10 +218,15 @@ fn find_migratio_cli_source(metadata: &Metadata, root_package: &Package) -> Migr
                     }
                 }
             }
+
+            // Found migratio in packages - use the same version for migratio-cli
+            // This ensures type compatibility between the user's migratio and migratio-cli
+            return MigratioCliSource::CratesIo(package.version.to_string());
         }
     }
 
-    // Default to crates.io with the same version as this binary
+    // Fallback to crates.io with the same version as this binary
+    // (this shouldn't normally happen if the user has migratio as a dependency)
     MigratioCliSource::CratesIo(env!("CARGO_PKG_VERSION").to_string())
 }
 
