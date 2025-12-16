@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-migratio"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -1445,7 +1445,7 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
 name = "migratio"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "ctor",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "migratio-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "migratio",
