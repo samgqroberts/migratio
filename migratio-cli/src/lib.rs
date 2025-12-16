@@ -20,6 +20,20 @@
 //!     run_sqlite(migrator, &database_url, args)
 //! }
 //! ```
+//!
+//! For PostgreSQL:
+//!
+//! ```ignore
+//! use migratio_cli::{CliArgs, run_postgres};
+//! use clap::Parser;
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let database_url = std::env::var("DATABASE_URL")?;
+//!     let migrator = my_app::migrations::get_postgres_migrator();
+//!     let args = CliArgs::parse();
+//!     run_postgres(migrator, &database_url, args)
+//! }
+//! ```
 
 use clap::{Parser, Subcommand};
 
@@ -166,6 +180,9 @@ mod sqlite {
 #[cfg(feature = "mysql")]
 pub use mysql_support::run_mysql;
 
+#[cfg(feature = "postgres")]
+pub use postgres_support::run_postgres;
+
 #[cfg(feature = "mysql")]
 mod mysql_support {
     use super::{CliArgs, Commands};
@@ -254,6 +271,100 @@ mod mysql_support {
                 // This command is handled before run_mysql is called.
                 // If we get here, something went wrong.
                 unreachable!("List command should be handled before run_mysql");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+mod postgres_support {
+    use super::{CliArgs, Commands};
+    use migratio::postgres::PostgresMigrator;
+    use postgres::{Client, NoTls};
+
+    /// Run the CLI with a PostgreSQL migrator.
+    ///
+    /// This function handles all CLI commands for PostgreSQL databases.
+    ///
+    /// # Arguments
+    ///
+    /// * `migrator` - The configured PostgreSQL migrator
+    /// * `database_url` - PostgreSQL connection URL
+    /// * `args` - Parsed CLI arguments
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` on success, or an error if the operation fails.
+    pub fn run_postgres(
+        migrator: PostgresMigrator,
+        database_url: &str,
+        args: CliArgs,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut client = Client::connect(database_url, NoTls)?;
+
+        match args.command {
+            Commands::Status => {
+                let version = migrator.get_current_version(&mut client)?;
+                let pending = migrator.preview_upgrade(&mut client)?;
+                println!("Current version: {}", version);
+                println!("Pending migrations: {}", pending.len());
+                for m in pending {
+                    println!("  - {} (v{})", m.name(), m.version());
+                }
+            }
+            Commands::Upgrade { to } => {
+                let report = match to {
+                    Some(target) => migrator.upgrade_to(&mut client, target)?,
+                    None => migrator.upgrade(&mut client)?,
+                };
+                if report.migrations_run.is_empty() {
+                    println!("No migrations to run.");
+                } else {
+                    println!("Migrations run: {:?}", report.migrations_run);
+                }
+            }
+            Commands::Downgrade { to } => {
+                let report = migrator.downgrade(&mut client, to)?;
+                if report.migrations_run.is_empty() {
+                    println!("No migrations to roll back.");
+                } else {
+                    println!("Migrations rolled back: {:?}", report.migrations_run);
+                }
+            }
+            Commands::History => {
+                let history = migrator.get_migration_history(&mut client)?;
+                if history.is_empty() {
+                    println!("No migrations have been applied yet.");
+                } else {
+                    println!("Migration history:");
+                    for entry in history {
+                        println!(
+                            "  v{}: {} (applied {})",
+                            entry.version, entry.name, entry.applied_at
+                        );
+                    }
+                }
+            }
+            Commands::Preview => {
+                let pending = migrator.preview_upgrade(&mut client)?;
+                if pending.is_empty() {
+                    println!("No pending migrations.");
+                } else {
+                    println!("Pending migrations:");
+                    for m in pending {
+                        println!("  - {} (v{})", m.name(), m.version());
+                        if let Some(desc) = m.description() {
+                            println!("    {}", desc);
+                        }
+                    }
+                }
+            }
+            Commands::List => {
+                // This command is handled before run_postgres is called.
+                // If we get here, something went wrong.
+                unreachable!("List command should be handled before run_postgres");
             }
         }
 

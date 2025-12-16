@@ -44,7 +44,7 @@ struct MigratioArgs {
 struct MigratioConfig {
     /// Path to the function that returns the migrator (e.g., "my_app::migrations::get_migrator")
     migrator_fn: String,
-    /// Database type: "sqlite" or "mysql"
+    /// Database type: "sqlite", "mysql", or "postgres"
     database: String,
     /// Environment variable for database URL (default: "DATABASE_URL")
     #[serde(default = "default_database_url_env")]
@@ -65,23 +65,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get project metadata
     let metadata = MetadataCommand::new().exec()?;
-    let root_package = metadata
-        .root_package()
-        .ok_or("No root package found. Are you in a Cargo project directory?")?;
+    let root_package = match metadata.root_package() {
+        Some(pkg) => pkg,
+        None => {
+            eprintln!("Error: No root package found.");
+            eprintln!();
+            eprintln!(
+                "This command must be run from within a package directory (not a workspace root)."
+            );
+            std::process::exit(1);
+        }
+    };
 
     // Find migratio configuration in package.metadata.migratio
-    let migratio_metadata = root_package
-        .metadata
-        .get("migratio")
-        .ok_or("No [package.metadata.migratio] found in Cargo.toml. Please add configuration.")?;
+    let migratio_metadata = match root_package.metadata.get("migratio") {
+        Some(meta) => meta,
+        None => {
+            eprintln!("Error: No [package.metadata.migratio] found in Cargo.toml.");
+            eprintln!();
+            eprintln!("Add configuration to your Cargo.toml:");
+            eprintln!("  [package.metadata.migratio]");
+            eprintln!("  migrator_fn = \"your_crate::migrations::get_migrator\"");
+            eprintln!("  database = \"sqlite\"  # or \"mysql\" or \"postgres\"");
+            std::process::exit(1);
+        }
+    };
 
     let config: MigratioConfig = serde_json::from_value(migratio_metadata.clone())
         .map_err(|e| format!("Invalid migratio config: {}", e))?;
 
     // Validate database type
-    if config.database != "sqlite" && config.database != "mysql" {
+    if config.database != "sqlite" && config.database != "mysql" && config.database != "postgres" {
         return Err(format!(
-            "Invalid database type '{}'. Must be 'sqlite' or 'mysql'.",
+            "Invalid database type '{}'. Must be 'sqlite', 'mysql', or 'postgres'.",
             config.database
         )
         .into());
@@ -218,6 +234,7 @@ fn generate_runner_cargo_toml(
     let feature = match config.database.as_str() {
         "sqlite" => "sqlite",
         "mysql" => "mysql",
+        "postgres" => "postgres",
         _ => "sqlite",
     };
 
@@ -273,6 +290,7 @@ fn generate_runner_main(config: &MigratioConfig) -> String {
     let run_fn = match config.database.as_str() {
         "sqlite" => "run_sqlite",
         "mysql" => "run_mysql",
+        "postgres" => "run_postgres",
         _ => "run_sqlite",
     };
 

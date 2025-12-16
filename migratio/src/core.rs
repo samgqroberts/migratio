@@ -242,6 +242,95 @@ pub trait Migration {
     fn mysql_precondition(&self, _conn: &mut mysql::Conn) -> Result<Precondition, Error> {
         Ok(Precondition::NeedsApply)
     }
+
+    #[cfg(feature = "postgres")]
+    /// Execute the migration's "up" logic for PostgreSQL.
+    ///
+    /// # PostgreSQL Transaction Safety
+    ///
+    /// Unlike MySQL, PostgreSQL fully supports transactional DDL. This means:
+    /// - DDL statements (CREATE TABLE, ALTER TABLE, DROP TABLE, etc.) are part of the transaction
+    /// - If a migration fails, all changes are automatically rolled back
+    /// - The database remains in a consistent state even if errors occur
+    ///
+    /// # Exceptions
+    ///
+    /// The following operations cannot be rolled back even in PostgreSQL:
+    /// - `CREATE DATABASE` / `DROP DATABASE`
+    /// - `CREATE TABLESPACE` / `DROP TABLESPACE`
+    ///
+    /// Avoid these operations in migrations if possible.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn postgres_up(&self, tx: &mut postgres::Transaction) -> Result<(), Error> {
+    ///     tx.execute(
+    ///         "CREATE TABLE users (
+    ///             id SERIAL PRIMARY KEY,
+    ///             name TEXT NOT NULL
+    ///         )",
+    ///         &[],
+    ///     )?;
+    ///     Ok(())
+    /// }
+    /// ```
+    fn postgres_up(&self, _tx: &mut postgres::Transaction) -> Result<(), Error> {
+        panic!(
+            "Migration {} ('{}') does not implement postgres_up(). Implement this method to use PostgreSQL.",
+            self.version(),
+            self.name()
+        )
+    }
+
+    #[cfg(feature = "postgres")]
+    /// Rollback this migration for PostgreSQL. This is optional - the default implementation panics.
+    /// If you want to support downgrade functionality, implement this method.
+    ///
+    /// PostgreSQL fully supports transactional DDL, so rollbacks are atomic and safe.
+    fn postgres_down(&self, _tx: &mut postgres::Transaction) -> Result<(), Error> {
+        panic!(
+            "Migration {} ('{}') does not support downgrade. Implement the postgres_down() method to enable rollback.",
+            self.version(),
+            self.name()
+        )
+    }
+
+    #[cfg(feature = "postgres")]
+    /// Optional precondition check for the migration.
+    ///
+    /// This method is called before running the migration's `up()` method during upgrade.
+    /// It allows the migration to check if its changes are already present in the database
+    /// (for example, when adopting migratio after using another migration tool).
+    ///
+    /// If this returns `Precondition::AlreadySatisfied`, the migration is stamped as applied
+    /// in the version table without running `up()`. If it returns `Precondition::NeedsApply`,
+    /// the migration runs normally via `up()`.
+    ///
+    /// The default implementation returns `Precondition::NeedsApply`, meaning migrations
+    /// always run unless you override this method.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn postgres_precondition(&self, tx: &mut postgres::Transaction) -> Result<Precondition, Error> {
+    ///     let row = tx.query_one(
+    ///         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')",
+    ///         &[],
+    ///     )?;
+    ///     let exists: bool = row.get(0);
+    ///     if exists {
+    ///         Ok(Precondition::AlreadySatisfied)
+    ///     } else {
+    ///         Ok(Precondition::NeedsApply)
+    ///     }
+    /// }
+    /// ```
+    fn postgres_precondition(
+        &self,
+        _tx: &mut postgres::Transaction,
+    ) -> Result<Precondition, Error> {
+        Ok(Precondition::NeedsApply)
+    }
 }
 
 impl PartialEq for dyn Migration {

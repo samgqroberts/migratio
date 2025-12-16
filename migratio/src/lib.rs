@@ -38,6 +38,7 @@
 //!
 //! - [`SQLite`](sqlite) - available with the `sqlite` feature flag.
 //! - [`MySQL`](mysql) - available with the `mysql` feature flag.
+//! - [`PostgreSQL`](postgres) - available with the `postgres` feature flag.
 
 mod core;
 pub use core::{AppliedMigration, Migration, MigrationFailure, MigrationReport, Precondition};
@@ -55,8 +56,15 @@ pub mod sqlite;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
+#[cfg(feature = "postgres")]
+#[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
+pub mod postgres;
+
 #[cfg(feature = "testing")]
 pub mod testing;
 
 #[cfg(all(test, feature = "mysql"))]
 pub(crate) mod test_mysql;
+
+#[cfg(all(test, feature = "postgres"))]
+pub(crate) mod test_postgres;

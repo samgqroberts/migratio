@@ -6,6 +6,7 @@ members = [
     "cargo-migratio",
     "examples/sqlite-app",
     "examples/mysql-app",
+    "examples/postgres-app",
 ]
 
 [workspace.package]

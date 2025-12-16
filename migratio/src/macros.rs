@@ -3,7 +3,7 @@
 /// Define a simple SQL-only migration.
 ///
 /// This macro reduces boilerplate for migrations that consist of simple SQL statements
-/// that work identically across SQLite and MySQL (or with minor dialect differences).
+/// that work identically across SQLite, MySQL, and PostgreSQL (or with minor dialect differences).
 ///
 /// # Basic Usage
 ///
@@ -18,17 +18,33 @@
 /// ```
 ///
 /// This expands to a struct `CreateUsersTable` that implements the [`Migration`](crate::Migration) trait
-/// with both `sqlite_up`/`sqlite_down` and `mysql_up`/`mysql_down` methods.
+/// with `sqlite_up`/`sqlite_down`, `mysql_up`/`mysql_down`, and `postgres_up`/`postgres_down` methods.
 ///
 /// # Database-Specific SQL
 ///
-/// When SQLite and MySQL require different SQL syntax, provide separate statements:
+/// When databases require different SQL syntax, provide separate statements:
 ///
 /// ```
 /// use migratio::sql_migration;
 ///
 /// sql_migration!(CreateUsersTable, 1, "Create users table",
 ///     sqlite_up: "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)",
+///     sqlite_down: "DROP TABLE users",
+///     mysql_up: "CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255))",
+///     mysql_down: "DROP TABLE users",
+///     postgres_up: "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)",
+///     postgres_down: "DROP TABLE users"
+/// );
+/// ```
+///
+/// For backwards compatibility, you can also specify just SQLite and MySQL - PostgreSQL will
+/// use the SQLite SQL since they share most syntax:
+///
+/// ```
+/// use migratio::sql_migration;
+///
+/// sql_migration!(CreateUsersTable, 1, "Create users table",
+///     sqlite_up: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
 ///     sqlite_down: "DROP TABLE users",
 ///     mysql_up: "CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255))",
 ///     mysql_down: "DROP TABLE users"
@@ -75,7 +91,7 @@
 ///
 /// Use `sql_migration!` when:
 /// - Your migration is pure SQL with no Rust logic
-/// - The SQL works on both databases (or you provide dialect-specific versions)
+/// - The SQL works on all databases (or you provide dialect-specific versions)
 /// - You don't need to query data and transform it in Rust
 ///
 /// For complex migrations that need to query data, transform it in Rust, and write it back,
@@ -91,7 +107,9 @@ macro_rules! sql_migration {
             sqlite_up: [$($up_sql),*],
             sqlite_down: [$($down_sql),*],
             mysql_up: [$($up_sql),*],
-            mysql_down: [$($down_sql),*]
+            mysql_down: [$($down_sql),*],
+            postgres_up: [$($up_sql),*],
+            postgres_down: [$($down_sql),*]
         );
     };
 
@@ -104,7 +122,9 @@ macro_rules! sql_migration {
             sqlite_up: [$up_sql],
             sqlite_down: [$down_sql],
             mysql_up: [$up_sql],
-            mysql_down: [$down_sql]
+            mysql_down: [$down_sql],
+            postgres_up: [$up_sql],
+            postgres_down: [$down_sql]
         );
     };
 
@@ -114,7 +134,8 @@ macro_rules! sql_migration {
     ) => {
         $crate::__sql_migration_impl_no_down!($name, $version, $migration_name,
             sqlite_up: [$($up_sql),*],
-            mysql_up: [$($up_sql),*]
+            mysql_up: [$($up_sql),*],
+            postgres_up: [$($up_sql),*]
         );
     };
 
@@ -124,11 +145,32 @@ macro_rules! sql_migration {
     ) => {
         $crate::__sql_migration_impl_no_down!($name, $version, $migration_name,
             sqlite_up: [$up_sql],
-            mysql_up: [$up_sql]
+            mysql_up: [$up_sql],
+            postgres_up: [$up_sql]
         );
     };
 
-    // Pattern 3: Database-specific SQL with down (single statements)
+    // Pattern 3a: Database-specific SQL with down (single statements, all three DBs)
+    ($name:ident, $version:expr, $migration_name:expr,
+        sqlite_up: $sqlite_up:expr,
+        sqlite_down: $sqlite_down:expr,
+        mysql_up: $mysql_up:expr,
+        mysql_down: $mysql_down:expr,
+        postgres_up: $postgres_up:expr,
+        postgres_down: $postgres_down:expr
+    ) => {
+        $crate::__sql_migration_impl!($name, $version, $migration_name,
+            sqlite_up: [$sqlite_up],
+            sqlite_down: [$sqlite_down],
+            mysql_up: [$mysql_up],
+            mysql_down: [$mysql_down],
+            postgres_up: [$postgres_up],
+            postgres_down: [$postgres_down]
+        );
+    };
+
+    // Pattern 3b: Database-specific SQL with down (single statements, SQLite/MySQL only - backwards compat)
+    // Uses SQLite SQL for Postgres since they share most syntax
     ($name:ident, $version:expr, $migration_name:expr,
         sqlite_up: $sqlite_up:expr,
         sqlite_down: $sqlite_down:expr,
@@ -139,18 +181,35 @@ macro_rules! sql_migration {
             sqlite_up: [$sqlite_up],
             sqlite_down: [$sqlite_down],
             mysql_up: [$mysql_up],
-            mysql_down: [$mysql_down]
+            mysql_down: [$mysql_down],
+            postgres_up: [$sqlite_up],
+            postgres_down: [$sqlite_down]
         );
     };
 
-    // Pattern 4: Database-specific SQL without down (single statements)
+    // Pattern 4a: Database-specific SQL without down (single statements, all three DBs)
+    ($name:ident, $version:expr, $migration_name:expr,
+        sqlite_up: $sqlite_up:expr,
+        mysql_up: $mysql_up:expr,
+        postgres_up: $postgres_up:expr
+    ) => {
+        $crate::__sql_migration_impl_no_down!($name, $version, $migration_name,
+            sqlite_up: [$sqlite_up],
+            mysql_up: [$mysql_up],
+            postgres_up: [$postgres_up]
+        );
+    };
+
+    // Pattern 4b: Database-specific SQL without down (single statements, SQLite/MySQL only - backwards compat)
+    // Uses SQLite SQL for Postgres since they share most syntax
     ($name:ident, $version:expr, $migration_name:expr,
         sqlite_up: $sqlite_up:expr,
         mysql_up: $mysql_up:expr
     ) => {
         $crate::__sql_migration_impl_no_down!($name, $version, $migration_name,
             sqlite_up: [$sqlite_up],
-            mysql_up: [$mysql_up]
+            mysql_up: [$mysql_up],
+            postgres_up: [$sqlite_up]
         );
     };
 }
@@ -163,7 +222,9 @@ macro_rules! __sql_migration_impl {
         sqlite_up: [$($sqlite_up:expr),*],
         sqlite_down: [$($sqlite_down:expr),*],
         mysql_up: [$($mysql_up:expr),*],
-        mysql_down: [$($mysql_down:expr),*]
+        mysql_down: [$($mysql_down:expr),*],
+        postgres_up: [$($postgres_up:expr),*],
+        postgres_down: [$($postgres_down:expr),*]
     ) => {
         pub struct $name;
 
@@ -201,6 +262,18 @@ macro_rules! __sql_migration_impl {
                 $(conn.query_drop($mysql_down)?;)*
                 Ok(())
             }
+
+            #[cfg(feature = "postgres")]
+            fn postgres_up(&self, tx: &mut ::postgres::Transaction) -> Result<(), $crate::Error> {
+                $(tx.execute($postgres_up, &[])?;)*
+                Ok(())
+            }
+
+            #[cfg(feature = "postgres")]
+            fn postgres_down(&self, tx: &mut ::postgres::Transaction) -> Result<(), $crate::Error> {
+                $(tx.execute($postgres_down, &[])?;)*
+                Ok(())
+            }
         }
     };
 }
@@ -211,7 +284,8 @@ macro_rules! __sql_migration_impl {
 macro_rules! __sql_migration_impl_no_down {
     ($name:ident, $version:expr, $migration_name:expr,
         sqlite_up: [$($sqlite_up:expr),*],
-        mysql_up: [$($mysql_up:expr),*]
+        mysql_up: [$($mysql_up:expr),*],
+        postgres_up: [$($postgres_up:expr),*]
     ) => {
         pub struct $name;
 
@@ -234,6 +308,12 @@ macro_rules! __sql_migration_impl_no_down {
             fn mysql_up(&self, conn: &mut ::mysql::Conn) -> Result<(), $crate::Error> {
                 use ::mysql::prelude::Queryable;
                 $(conn.query_drop($mysql_up)?;)*
+                Ok(())
+            }
+
+            #[cfg(feature = "postgres")]
+            fn postgres_up(&self, tx: &mut ::postgres::Transaction) -> Result<(), $crate::Error> {
+                $(tx.execute($postgres_up, &[])?;)*
                 Ok(())
             }
         }
