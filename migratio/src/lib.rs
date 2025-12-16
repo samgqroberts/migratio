@@ -1,5 +1,4 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// TODO rerun cargo readme-doc
 //! `migratio` is a lightweight library for managing database migrations.
 //!
 //! Core concepts:
@@ -45,6 +44,9 @@ pub use core::{AppliedMigration, Migration, MigrationFailure, MigrationReport, P
 
 mod error;
 pub use error::Error;
+
+#[macro_use]
+mod macros;
 
 #[cfg(feature = "sqlite")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]

@@ -377,7 +377,34 @@ impl GenericMigrator {
     }
 
     /// Calculate a checksum for a migration based on its version and name.
-    /// This is used to verify that migrations haven't been modified after being applied.
+    ///
+    /// This checksum is stored when a migration is applied and verified on subsequent runs
+    /// to detect if a migration's identity has changed after being applied.
+    ///
+    /// # What the checksum covers
+    ///
+    /// The checksum is calculated from:
+    /// - The migration's `version()` number
+    /// - The migration's `name()` string
+    ///
+    /// # What the checksum does NOT cover
+    ///
+    /// The checksum intentionally does **not** include:
+    /// - The migration's `up()` or `down()` logic
+    /// - The migration's `description()`
+    /// - Any other runtime behavior
+    ///
+    /// This is a deliberate design choice: Rust closures and trait method implementations
+    /// cannot be meaningfully hashed at runtime. The checksum serves to detect accidental
+    /// renaming or version number changes, not to verify that migration logic is unchanged.
+    ///
+    /// # Implications
+    ///
+    /// - Changing a migration's `version()` or `name()` after it has been applied will cause
+    ///   a checksum mismatch error on subsequent runs.
+    /// - Changing a migration's `up()` logic after it has been applied will **not** be detected.
+    ///   This is the user's responsibility to avoid.
+    /// - The `description()` can be freely changed at any time.
     pub fn calculate_checksum(migration: &Box<dyn Migration>) -> String {
         let mut hasher = Sha256::new();
         hasher.update(migration.version().to_string().as_bytes());

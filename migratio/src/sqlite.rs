@@ -1,6 +1,21 @@
 //!
 //! # SQLite migration support
 //!
+//! This module provides SQLite migration support using the [`rusqlite`](https://crates.io/crates/rusqlite) crate.
+//!
+//! ## SQLite Linking
+//!
+//! The `sqlite` feature pulls in `rusqlite` as a dependency. By default, `rusqlite` links against
+//! your system's SQLite library. If you need bundled SQLite, encryption support, or other options,
+//! add `rusqlite` as a direct dependency in your `Cargo.toml` with the appropriate features.
+//! See the [rusqlite documentation](https://docs.rs/rusqlite) for available features.
+//!
+//! ## Transaction Safety
+//!
+//! Each migration runs within its own SQLite transaction. If a migration fails (returns an error
+//! or panics), the transaction is automatically rolled back, leaving the database in the state
+//! it was in after the last successful migration.
+//!
 //! ## Example
 //!
 //! ```

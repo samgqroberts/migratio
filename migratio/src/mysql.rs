@@ -1,6 +1,80 @@
 //!
 //! # MySQL migration support
 //!
+//! This module provides MySQL migration support using the [`mysql`](https://crates.io/crates/mysql) crate.
+//!
+//! ## Important: DDL and Transaction Limitations
+//!
+//! **MySQL handles DDL (Data Definition Language) statements differently than SQLite.**
+//! Understanding this is critical for writing reliable migrations.
+//!
+//! ### The Core Issue
+//!
+//! In MySQL, DDL statements like `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE INDEX`, etc.
+//! cause an **implicit commit** and **cannot be rolled back**. This is a fundamental MySQL behavior,
+//! not a limitation of this library.
+//!
+//! This means:
+//! - If a migration fails partway through, any DDL that already executed will remain in the database
+//! - The migration version will NOT be recorded (allowing you to fix and retry)
+//! - You may need to manually clean up partial changes before retrying
+//!
+//! ### Comparison with SQLite
+//!
+//! | Behavior | SQLite | MySQL |
+//! |----------|--------|-------|
+//! | DDL in transactions | Fully supported | Causes implicit commit |
+//! | Migration failure | Complete rollback | Partial DDL may persist |
+//! | Method parameter | `&Transaction` | `&mut Conn` |
+//! | Automatic cleanup | Yes | Manual intervention may be needed |
+//!
+//! ### Best Practices for MySQL Migrations
+//!
+//! 1. **Make migrations idempotent** - Use `IF EXISTS` / `IF NOT EXISTS`:
+//!    ```ignore
+//!    fn mysql_up(&self, conn: &mut Conn) -> Result<(), Error> {
+//!        conn.query_drop("CREATE TABLE IF NOT EXISTS users (...)")?;
+//!        Ok(())
+//!    }
+//!    ```
+//!
+//! 2. **Keep migrations small and focused** - One logical change per migration reduces the
+//!    impact of partial failures.
+//!
+//! 3. **Order statements carefully** - Put riskier operations (like data transformations)
+//!    before DDL when possible, since data changes may be easier to reverse manually.
+//!
+//! 4. **Test thoroughly in staging** - DDL failures in production require manual intervention.
+//!
+//! 5. **Consider `down()` carefully** - Even `down()` migrations cannot atomically reverse DDL.
+//!
+//! ### What Happens on Failure
+//!
+//! ```text
+//! Migration 3 starts
+//!   ├── CREATE TABLE orders (...)     ✓ Committed immediately
+//!   ├── CREATE INDEX idx_orders (...)  ✓ Committed immediately
+//!   └── ALTER TABLE users ADD (...)    ✗ Error!
+//!
+//! Result:
+//!   - "orders" table EXISTS (cannot be rolled back)
+//!   - "idx_orders" index EXISTS (cannot be rolled back)
+//!   - Migration 3 is NOT recorded in version table
+//!   - You must manually DROP the partial changes before retrying
+//! ```
+//!
+//! ### Recovery from Partial Failures
+//!
+//! If a migration fails partway through:
+//!
+//! 1. Check the database state to see what was applied
+//! 2. Manually reverse the partial changes (or make your migration idempotent)
+//! 3. Fix the migration code
+//! 4. Run migrations again
+//!
+//! Because the failed migration version was not recorded, the migrator will attempt to
+//! run it again on the next `upgrade()` call.
+//!
 
 use crate::core::GenericMigrator;
 use crate::error::Error;
