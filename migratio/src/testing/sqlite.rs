@@ -130,7 +130,8 @@ impl SqliteTestHarness {
 
     /// Migrate to a specific version.
     ///
-    /// Returns an error if the target version does not exist in the migration list.
+    /// Returns an error if the target version does not exist in the migration list,
+    /// or if any migration fails during execution.
     pub fn migrate_to(&mut self, target_version: u32) -> Result<(), Error> {
         // Validate target version exists (version 0 is always valid for empty state)
         if target_version > 0 {
@@ -159,10 +160,16 @@ impl SqliteTestHarness {
 
         if target_version > current {
             // Migrate up to target version
-            self.migrator.upgrade_to(&mut self.conn, target_version)?;
+            let report = self.migrator.upgrade_to(&mut self.conn, target_version)?;
+            if let Some(failure) = report.failing_migration {
+                return Err(failure.error);
+            }
         } else if target_version < current {
             // Migrate down
-            self.migrator.downgrade(&mut self.conn, target_version)?;
+            let report = self.migrator.downgrade(&mut self.conn, target_version)?;
+            if let Some(failure) = report.failing_migration {
+                return Err(failure.error);
+            }
         }
 
         Ok(())
@@ -183,6 +190,8 @@ impl SqliteTestHarness {
     }
 
     /// Migrate down by exactly one migration.
+    ///
+    /// Returns an error if already at version 0, or if the migration fails.
     pub fn migrate_down_one(&mut self) -> Result<(), Error> {
         let current = self.current_version()?;
         if current == 0 {
@@ -191,7 +200,10 @@ impl SqliteTestHarness {
             )));
         }
 
-        self.migrator.downgrade(&mut self.conn, current - 1)?;
+        let report = self.migrator.downgrade(&mut self.conn, current - 1)?;
+        if let Some(failure) = report.failing_migration {
+            return Err(failure.error);
+        }
         Ok(())
     }
 
@@ -970,5 +982,151 @@ mod tests {
             .query_one("SELECT data FROM prefs WHERE name = 'alice'")
             .unwrap();
         assert_eq!(data, r#"{"theme":"dark"}"#);
+    }
+
+    #[test]
+    fn test_migrate_to_propagates_migration_error() {
+        // Migration that creates a table with a UNIQUE constraint
+        struct SetupMigration;
+        impl Migration for SetupMigration {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute(
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+                    [],
+                )?;
+                // Insert a row that will cause a conflict in the next migration
+                tx.execute("INSERT INTO users (id, email) VALUES (1, 'test@example.com')", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE users", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        // Migration that will fail due to UNIQUE constraint violation
+        struct FailingMigration;
+        impl Migration for FailingMigration {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                // This will fail because email already exists
+                tx.execute(
+                    "INSERT INTO users (id, email) VALUES (2, 'test@example.com')",
+                    [],
+                )?;
+                Ok(())
+            }
+            fn sqlite_down(&self, _tx: &Transaction) -> Result<(), Error> {
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(SetupMigration),
+            Box::new(FailingMigration),
+        ]));
+
+        // First migration should succeed
+        harness.migrate_to(1).unwrap();
+        assert_eq!(harness.current_version().unwrap(), 1);
+
+        // Second migration should fail and return an error (not Ok(()))
+        let result = harness.migrate_to(2);
+        assert!(result.is_err(), "migrate_to should return Err when migration fails");
+
+        // The error should contain information about the UNIQUE constraint violation
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("UNIQUE constraint failed"),
+            "Error message should mention UNIQUE constraint: {}",
+            err_msg
+        );
+
+        // Database should still be at version 1 (migration 2 was rolled back)
+        assert_eq!(harness.current_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_migrate_down_one_propagates_migration_error() {
+        // Migration with a down() that works
+        struct Migration1;
+        impl Migration for Migration1 {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE users", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        // Migration with a down() that fails
+        struct Migration2;
+        impl Migration for Migration2 {
+            fn version(&self) -> u32 {
+                2
+            }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("ALTER TABLE users ADD COLUMN email TEXT", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                // This will fail - invalid SQL
+                tx.execute("INVALID SQL STATEMENT", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(Migration1),
+            Box::new(Migration2),
+        ]));
+
+        // Migrate up to version 2
+        harness.migrate_to(2).unwrap();
+        assert_eq!(harness.current_version().unwrap(), 2);
+
+        // migrate_down_one should fail and return an error
+        let result = harness.migrate_down_one();
+        assert!(
+            result.is_err(),
+            "migrate_down_one should return Err when migration down() fails"
+        );
+
+        // The error should contain SQL syntax error information
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("syntax error"),
+            "Error message should mention syntax error: {}",
+            err_msg
+        );
+
+        // Database should still be at version 2 (rollback was rolled back)
+        assert_eq!(harness.current_version().unwrap(), 2);
     }
 }

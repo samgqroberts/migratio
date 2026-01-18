@@ -99,7 +99,8 @@ impl PostgresTestHarness {
 
     /// Migrate to a specific version.
     ///
-    /// Returns an error if the target version does not exist in the migration list.
+    /// Returns an error if the target version does not exist in the migration list,
+    /// or if any migration fails during execution.
     pub fn migrate_to(&mut self, target_version: u32) -> Result<(), Error> {
         // Validate target version exists (version 0 is always valid for empty state)
         if target_version > 0 {
@@ -126,10 +127,16 @@ impl PostgresTestHarness {
 
         if target_version > current {
             // Migrate up to target version
-            self.migrator.upgrade_to(&mut self.client, target_version)?;
+            let report = self.migrator.upgrade_to(&mut self.client, target_version)?;
+            if let Some(failure) = report.failing_migration {
+                return Err(failure.error);
+            }
         } else if target_version < current {
             // Migrate down
-            self.migrator.downgrade(&mut self.client, target_version)?;
+            let report = self.migrator.downgrade(&mut self.client, target_version)?;
+            if let Some(failure) = report.failing_migration {
+                return Err(failure.error);
+            }
         }
 
         Ok(())
@@ -150,6 +157,8 @@ impl PostgresTestHarness {
     }
 
     /// Migrate down by exactly one migration.
+    ///
+    /// Returns an error if already at version 0, or if the migration fails.
     pub fn migrate_down_one(&mut self) -> Result<(), Error> {
         let current = self.current_version()?;
         if current == 0 {
@@ -158,7 +167,10 @@ impl PostgresTestHarness {
             ));
         }
 
-        self.migrator.downgrade(&mut self.client, current - 1)?;
+        let report = self.migrator.downgrade(&mut self.client, current - 1)?;
+        if let Some(failure) = report.failing_migration {
+            return Err(failure.error);
+        }
         Ok(())
     }
 
