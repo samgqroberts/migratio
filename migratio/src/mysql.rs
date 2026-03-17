@@ -81,6 +81,7 @@ use crate::error::Error;
 use crate::AppliedMigration;
 use crate::Migration;
 use crate::MigrationFailure;
+use crate::MigrationType;
 use crate::MigrationReport;
 use crate::Precondition;
 use chrono::Utc;
@@ -235,6 +236,7 @@ impl MysqlMigrator {
                     name,
                     applied_at,
                     checksum,
+                    migration_type: MigrationType::Migration,
                 })
             })
             .collect();

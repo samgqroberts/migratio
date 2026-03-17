@@ -887,12 +887,235 @@
 //!
 
 use crate::{
-    core::GenericMigrator, error::Error, AppliedMigration, Migration, MigrationFailure,
-    MigrationReport, Precondition,
+    core::{AppliedMigrationRow, GenericMigrator, MigrationBackend, MigrationType},
+    error::Error,
+    AppliedMigration, Migration, MigrationReport, Precondition,
 };
+#[cfg(test)]
+use crate::MigrationFailure;
 use chrono::Utc;
 use rusqlite::{params, Connection};
-use std::time::Instant;
+
+/// SQLite-specific backend implementing the MigrationBackend trait.
+pub(crate) struct SqliteBackend;
+
+impl MigrationBackend for SqliteBackend {
+    type Conn = Connection;
+
+    fn version_table_exists(conn: &mut Connection, table_name: &str) -> Result<bool, Error> {
+        let mut stmt =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
+        let exists = stmt.query([table_name])?.next()?.is_some();
+        Ok(exists)
+    }
+
+    fn create_version_table(conn: &mut Connection, table_name: &str) -> Result<(), Error> {
+        // Create table with all columns including migration_type
+        // Use IF NOT EXISTS to handle concurrent creation attempts
+        conn.execute(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {} (version integer primary key not null, name text not null, applied_at text not null, checksum text not null, migration_type text not null default 'migration')",
+                table_name
+            ),
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn column_exists(
+        conn: &mut Connection,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<bool, Error> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table_name))?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(columns.contains(&column_name.to_string()))
+    }
+
+    fn add_column(
+        conn: &mut Connection,
+        table_name: &str,
+        column_name: &str,
+        column_def: &str,
+    ) -> Result<(), Error> {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                table_name, column_name, column_def
+            ),
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn get_applied_migration_rows(
+        conn: &mut Connection,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigrationRow>, Error> {
+        let mut stmt =
+            conn.prepare(&format!("SELECT version, name, checksum FROM {}", table_name))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AppliedMigrationRow {
+                    version: row.get(0)?,
+                    name: row.get(1)?,
+                    checksum: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn get_max_version(conn: &mut Connection, table_name: &str) -> Result<u32, Error> {
+        let mut stmt =
+            conn.prepare(&format!("SELECT MAX(version) from {}", table_name))?;
+        let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
+        Ok(version.unwrap_or(0))
+    }
+
+    fn get_migration_history_rows(
+        conn: &mut Connection,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigration>, Error> {
+        // Check whether the migration_type column exists for backwards compatibility
+        let has_migration_type = {
+            let mut stmt =
+                conn.prepare(&format!("PRAGMA table_info({})", table_name))?;
+            let columns: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.contains(&"migration_type".to_string())
+        };
+
+        let query = if has_migration_type {
+            format!(
+                "SELECT version, name, applied_at, checksum, migration_type FROM {} ORDER BY version",
+                table_name
+            )
+        } else {
+            format!(
+                "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
+                table_name
+            )
+        };
+
+        let mut stmt = conn.prepare(&query)?;
+
+        let migrations = if has_migration_type {
+            stmt.query_map([], |row| {
+                let applied_at_str: String = row.get(2)?;
+                let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+                    .with_timezone(&Utc);
+                let migration_type_str: String = row.get(4)?;
+                let migration_type = if migration_type_str == "baseline" {
+                    MigrationType::Baseline
+                } else {
+                    MigrationType::Migration
+                };
+                Ok(AppliedMigration {
+                    version: row.get(0)?,
+                    name: row.get(1)?,
+                    applied_at,
+                    checksum: row.get(3)?,
+                    migration_type,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], |row| {
+                let applied_at_str: String = row.get(2)?;
+                let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+                    .with_timezone(&Utc);
+                Ok(AppliedMigration {
+                    version: row.get(0)?,
+                    name: row.get(1)?,
+                    applied_at,
+                    checksum: row.get(3)?,
+                    migration_type: MigrationType::Migration,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(migrations)
+    }
+
+    fn execute_migration_up(
+        conn: &mut Connection,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+        applied_at: &str,
+        checksum: &str,
+        migration_type: MigrationType,
+    ) -> Result<bool, Error> {
+        // Start a transaction for this migration
+        let tx = conn.transaction()?;
+
+        // Check precondition
+        let precondition = migration.sqlite_precondition(&tx)?;
+
+        match precondition {
+            Precondition::AlreadySatisfied => {
+                // Stamp the migration without running up()
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {} (version, name, applied_at, checksum, migration_type) VALUES(?1, ?2, ?3, ?4, ?5)",
+                        table_name
+                    ),
+                    params![migration.version(), migration.name(), applied_at, checksum, migration_type.to_string()],
+                )?;
+                tx.commit()?;
+                Ok(false)
+            }
+            Precondition::NeedsApply => {
+                migration.sqlite_up(&tx)?;
+                // Insert version row inside the same transaction (atomic with migration)
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {} (version, name, applied_at, checksum, migration_type) VALUES(?1, ?2, ?3, ?4, ?5)",
+                        table_name
+                    ),
+                    params![migration.version(), migration.name(), applied_at, checksum, migration_type.to_string()],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn execute_migration_down(
+        conn: &mut Connection,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+    ) -> Result<(), Error> {
+        // Start a transaction for this migration rollback
+        let tx = conn.transaction()?;
+        migration.sqlite_down(&tx)?;
+        // Delete version row inside the same transaction (atomic with rollback)
+        tx.execute(
+            &format!("DELETE FROM {} WHERE version = ?1", table_name),
+            params![migration.version()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
 
 /// The entrypoint for running a sequence of [Migration]s.
 /// Construct this struct with the list of all [Migration]s to be applied.
@@ -1080,25 +1303,7 @@ impl SqliteMigrator {
     /// Get the current migration version from the database.
     /// Returns 0 if no migrations have been applied.
     pub fn get_current_version(&self, conn: &mut Connection) -> Result<u32, Error> {
-        // Check if schema version table exists
-        let mut stmt =
-            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
-        let table_exists = stmt
-            .query([&self.schema_version_table_name()])?
-            .next()?
-            .is_some();
-
-        if !table_exists {
-            return Ok(0);
-        }
-
-        // Get current version (highest version number)
-        let mut stmt = conn.prepare(&format!(
-            "SELECT MAX(version) from {}",
-            self.schema_version_table_name()
-        ))?;
-        let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
-        Ok(version.unwrap_or(0))
+        self.migrator.generic_get_current_version::<SqliteBackend>(conn)
     }
 
     /// Get the history of all migrations that have been applied to the database.
@@ -1108,47 +1313,7 @@ impl SqliteMigrator {
         &self,
         conn: &mut Connection,
     ) -> Result<Vec<AppliedMigration>, Error> {
-        // Check if schema version table exists
-        let mut stmt =
-            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
-        let table_exists = stmt
-            .query([&self.schema_version_table_name()])?
-            .next()?
-            .is_some();
-
-        if !table_exists {
-            return Ok(vec![]);
-        }
-
-        // Query all applied migrations, ordered by version
-        let mut stmt = conn.prepare(&format!(
-            "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
-            self.schema_version_table_name()
-        ))?;
-
-        let migrations = stmt
-            .query_map([], |row| {
-                let applied_at_str: String = row.get(2)?;
-                let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?
-                    .with_timezone(&Utc);
-
-                Ok(AppliedMigration {
-                    version: row.get(0)?,
-                    name: row.get(1)?,
-                    applied_at,
-                    checksum: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(migrations)
+        self.migrator.generic_get_migration_history::<SqliteBackend>(conn)
     }
 
     /// Preview which migrations would be applied by `upgrade()` without actually running them.
@@ -1157,16 +1322,7 @@ impl SqliteMigrator {
         &self,
         conn: &mut Connection,
     ) -> Result<Vec<&Box<dyn Migration>>, Error> {
-        let current_version = self.get_current_version(conn)?;
-
-        let mut pending_migrations = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > current_version)
-            .collect::<Vec<_>>();
-        pending_migrations.sort_by_key(|m| m.version());
-
-        Ok(pending_migrations)
+        self.migrator.generic_preview_upgrade::<SqliteBackend>(conn)
     }
 
     /// Preview which migrations would be rolled back by `downgrade(target_version)` without actually running them.
@@ -1176,26 +1332,8 @@ impl SqliteMigrator {
         conn: &mut Connection,
         target_version: u32,
     ) -> Result<Vec<&Box<dyn Migration>>, Error> {
-        let current_version = self.get_current_version(conn)?;
-
-        // Validate target version
-        if target_version > current_version {
-            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                format!(
-                    "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
-                    target_version, current_version
-                ),
-            )));
-        }
-
-        let mut migrations_to_rollback = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > target_version && m.version() <= current_version)
-            .collect::<Vec<_>>();
-        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.version())); // Reverse order
-
-        Ok(migrations_to_rollback)
+        self.migrator
+            .generic_preview_downgrade::<SqliteBackend>(conn, target_version)
     }
 
     /// Apply all previously-unapplied [Migration]s to the database with the given [Connection].
@@ -1225,340 +1363,15 @@ impl SqliteMigrator {
             )));
         }
 
-        self.upgrade_internal(conn, Some(target_version))
+        self.setup_concurrency_protection(conn)?;
+        self.migrator
+            .generic_upgrade::<SqliteBackend>(conn, Some(target_version))
     }
 
     /// Upgrade the database by running all pending migrations.
     pub fn upgrade(&self, conn: &mut Connection) -> Result<MigrationReport<'_>, Error> {
-        self.upgrade_internal(conn, None)
-    }
-
-    fn upgrade_internal(
-        &self,
-        conn: &mut Connection,
-        target_version: Option<u32>,
-    ) -> Result<MigrationReport<'_>, Error> {
-        // Set up concurrency protection
         self.setup_concurrency_protection(conn)?;
-        // if schema version tracking table does not exist, create it
-        let schema_version_table_existed = {
-            let mut stmt =
-                conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
-            let schema_version_table_existed = stmt
-                .query([&self.schema_version_table_name()])?
-                .next()?
-                .is_some();
-            if !schema_version_table_existed {
-                #[cfg(feature = "tracing")]
-                tracing::info!(
-                    "Creating migration tracking table: {}",
-                    self.schema_version_table_name()
-                );
-                // create table with name and checksum columns
-                // Use IF NOT EXISTS to handle concurrent creation attempts
-                conn.execute(
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS {} (version integer primary key not null, name text not null, applied_at text not null, checksum text not null)",
-                    self.schema_version_table_name()
-                ),
-                [],)?;
-            }
-            #[cfg(feature = "tracing")]
-            if schema_version_table_existed {
-                tracing::debug!(
-                    "Migration tracking table '{}' exists",
-                    self.schema_version_table_name()
-                );
-            }
-            schema_version_table_existed
-        };
-
-        // Validate checksums of previously-applied migrations
-        if schema_version_table_existed {
-            // Check if the checksum column exists (for backwards compatibility)
-            let has_checksum_column = {
-                let mut stmt = conn.prepare(&format!(
-                    "PRAGMA table_info({})",
-                    self.schema_version_table_name()
-                ))?;
-                let columns: Vec<String> = stmt
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                columns.contains(&"checksum".to_string())
-            };
-
-            if has_checksum_column {
-                // Get all applied migrations with their checksums
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT version, name, checksum FROM {}",
-                    self.schema_version_table_name()
-                ))?;
-                let applied_migrations: Vec<(u32, String, String)> = stmt
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                // Verify checksums match for migrations that were already applied
-                // Also detect missing migrations (in DB but not in code)
-                for (applied_version, applied_name, applied_checksum) in &applied_migrations {
-                    if let Some(migration) = self
-                        .migrations()
-                        .iter()
-                        .find(|m| m.version() == *applied_version)
-                    {
-                        let current_checksum = GenericMigrator::calculate_checksum(migration);
-                        if current_checksum != *applied_checksum {
-                            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                                format!(
-                                    "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                                    Migration name in DB: '{}', current name: '{}'. \
-                                    This indicates the migration was modified after being applied.",
-                                    applied_version,
-                                    applied_checksum,
-                                    current_checksum,
-                                    applied_name,
-                                    migration.name()
-                                ),
-                            )));
-                        }
-                    } else {
-                        // Migration exists in database but not in code - this is a missing migration
-                        return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                            format!(
-                                "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
-                                Applied migrations cannot be removed from the codebase.",
-                                applied_version,
-                                applied_name
-                            ),
-                        )));
-                    }
-                }
-
-                // Detect orphaned migrations (in code but applied migrations are not contiguous)
-                // For example: DB has [1, 2, 4] but code has [1, 2, 3, 4]
-                // This means migration 3 was added after migration 4 was already applied
-                let applied_versions: Vec<u32> =
-                    applied_migrations.iter().map(|(v, _, _)| *v).collect();
-                if !applied_versions.is_empty() {
-                    let max_applied = *applied_versions.iter().max().unwrap();
-
-                    // Check if all migrations up to max_applied exist in the database
-                    for expected_version in 1..=max_applied {
-                        if !applied_versions.contains(&expected_version) {
-                            // There's a gap - check if this migration exists in our code
-                            if let Some(missing_migration) = self
-                                .migrations()
-                                .iter()
-                                .find(|m| m.version() == expected_version)
-                            {
-                                return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                                    format!(
-                                        "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
-                                        This likely means migration {} was added after migration {} was already applied. \
-                                        Applied migrations: {:?}",
-                                        expected_version,
-                                        missing_migration.name(),
-                                        expected_version,
-                                        max_applied,
-                                        applied_versions
-                                    ),
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // get current migration version (highest version number)
-        let current_version: u32 = {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT MAX(version) from {}",
-                self.schema_version_table_name()
-            ))?;
-            let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
-            version.unwrap_or(0)
-        };
-        // iterate through migrations, run those that haven't been run
-        let mut migrations_run: Vec<u32> = Vec::new();
-        let mut migrations_sorted = self
-            .migrations()
-            .iter()
-            .map(|x| (x.version(), x))
-            .collect::<Vec<_>>();
-        migrations_sorted.sort_by_key(|m| m.0);
-        let mut failing_migration: Option<MigrationFailure> = None;
-        let mut schema_version_table_created = false;
-        // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
-        let batch_applied_at = Utc::now().to_rfc3339();
-
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            current_version = current_version,
-            target_version = ?target_version,
-            available_migrations = ?migrations_sorted.iter().map(|(v, m)| (*v, m.name())).collect::<Vec<_>>(),
-            "Considering migrations to run"
-        );
-
-        for (migration_version, migration) in migrations_sorted {
-            // Stop if we've reached the target version (if specified)
-            if let Some(target) = target_version {
-                if migration_version > target {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        migration_version = migration_version,
-                        target_version = target,
-                        "Skipping migration (beyond target version)"
-                    );
-                    break;
-                }
-            }
-
-            if current_version < migration_version {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    migration_version = migration_version,
-                    migration_name = %migration.name(),
-                    "Migration needs to be applied"
-                );
-                #[cfg(feature = "tracing")]
-                let _span = tracing::info_span!(
-                    "migration_up",
-                    version = migration_version,
-                    name = %migration.name()
-                )
-                .entered();
-
-                #[cfg(feature = "tracing")]
-                tracing::info!("Starting migration");
-
-                // Call on_migration_start hook
-                if let Some(ref callback) = self.migrator.on_migration_start {
-                    callback(migration_version, &migration.name());
-                }
-
-                let migration_start = Instant::now();
-
-                // Run migration or stamp if precondition is satisfied
-                // We wrap this in a block to ensure the transaction is dropped before we use conn
-                let migration_result = {
-                    // Start a transaction for this migration
-                    let tx = conn.transaction()?;
-
-                    // Check precondition
-                    let precondition = match migration.sqlite_precondition(&tx) {
-                        Ok(p) => p,
-                        Err(error) => {
-                            #[cfg(feature = "tracing")]
-                            tracing::error!(
-                                error = %error,
-                                "Precondition check failed"
-                            );
-
-                            // Call on_migration_error hook
-                            if let Some(ref callback) = self.migrator.on_migration_error {
-                                callback(migration_version, &migration.name(), &error);
-                            }
-
-                            // Transaction will be automatically rolled back when dropped
-                            failing_migration = Some(MigrationFailure { migration, error });
-                            break;
-                        }
-                    };
-
-                    match precondition {
-                        Precondition::AlreadySatisfied => {
-                            #[cfg(feature = "tracing")]
-                            tracing::info!("Precondition already satisfied, stamping migration without running up()");
-
-                            // Call on_migration_skipped hook
-                            if let Some(ref callback) = self.migrator.on_migration_skipped {
-                                callback(migration_version, &migration.name());
-                            }
-
-                            // Commit the transaction (even though we didn't run up())
-                            tx.commit()?;
-                            Ok(())
-                        }
-                        Precondition::NeedsApply => {
-                            let result = migration.sqlite_up(&tx);
-                            if result.is_ok() {
-                                // Commit the transaction
-                                tx.commit()?;
-                            }
-                            result
-                        }
-                    }
-                };
-
-                match migration_result {
-                    Ok(_) => {
-                        let migration_duration = migration_start.elapsed();
-
-                        #[cfg(feature = "tracing")]
-                        tracing::info!(
-                            duration_ms = migration_duration.as_millis(),
-                            "Migration completed successfully"
-                        );
-
-                        // Calculate checksum for this migration
-                        let checksum = GenericMigrator::calculate_checksum(migration);
-
-                        // Insert a row for this migration with its name, timestamp, and checksum
-                        conn.execute(
-                            &format!(
-                                "INSERT INTO {} (version, name, applied_at, checksum) VALUES(?1, ?2, ?3, ?4)",
-                                self.schema_version_table_name()
-                            ),
-                            params![migration_version, migration.name(), &batch_applied_at, checksum],
-                        )?;
-
-                        // record migration as run
-                        migrations_run.push(migration_version);
-                        // also, since any migration succeeded, if schema version table had not originally existed,
-                        // we can mark that it was created
-                        schema_version_table_created = true;
-
-                        // Call on_migration_complete hook
-                        if let Some(ref callback) = self.migrator.on_migration_complete {
-                            callback(migration_version, &migration.name(), migration_duration);
-                        }
-                    }
-                    Err(e) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            error = %e,
-                            "Migration failed"
-                        );
-
-                        // Call on_migration_error hook
-                        if let Some(ref callback) = self.migrator.on_migration_error {
-                            callback(migration_version, &migration.name(), &e);
-                        }
-
-                        // Transaction will be automatically rolled back when dropped
-                        failing_migration = Some(MigrationFailure {
-                            migration,
-                            error: e,
-                        });
-                        break;
-                    }
-                }
-            } else {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    migration_version = migration_version,
-                    current_version = current_version,
-                    "Skipping migration (already applied)"
-                );
-            }
-        }
-        // return report
-        Ok(MigrationReport {
-            schema_version_table_existed,
-            schema_version_table_created,
-            failing_migration,
-            migrations_run,
-        })
+        self.migrator.generic_upgrade::<SqliteBackend>(conn, None)
     }
 
     /// Rollback migrations down to the specified target version.
@@ -1571,229 +1384,9 @@ impl SqliteMigrator {
         conn: &mut Connection,
         target_version: u32,
     ) -> Result<MigrationReport<'_>, Error> {
-        // Set up concurrency protection
         self.setup_concurrency_protection(conn)?;
-        // Check if schema version table exists
-        let schema_version_table_existed = {
-            let mut stmt =
-                conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?1")?;
-            let exists = stmt
-                .query([self.schema_version_table_name()])?
-                .next()?
-                .is_some();
-            exists
-        };
-
-        if !schema_version_table_existed {
-            // No migrations have been applied yet
-            return Ok(MigrationReport {
-                schema_version_table_existed: false,
-                schema_version_table_created: false,
-                failing_migration: None,
-                migrations_run: vec![],
-            });
-        }
-
-        // Validate checksums of previously-applied migrations (same as upgrade)
-        let has_checksum_column = {
-            let mut stmt = conn.prepare(&format!(
-                "PRAGMA table_info({})",
-                self.schema_version_table_name()
-            ))?;
-            let columns: Vec<String> = stmt
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?;
-            columns.contains(&"checksum".to_string())
-        };
-
-        if has_checksum_column {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT version, name, checksum FROM {}",
-                self.schema_version_table_name()
-            ))?;
-            let applied_migrations: Vec<(u32, String, String)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // Verify checksums and detect missing migrations
-            for (applied_version, applied_name, applied_checksum) in &applied_migrations {
-                if let Some(migration) = self
-                    .migrations()
-                    .iter()
-                    .find(|m| m.version() == *applied_version)
-                {
-                    let current_checksum = GenericMigrator::calculate_checksum(migration);
-                    if current_checksum != *applied_checksum {
-                        return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                            format!(
-                                "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                                Migration name in DB: '{}', current name: '{}'. \
-                                This indicates the migration was modified after being applied.",
-                                applied_version,
-                                applied_checksum,
-                                current_checksum,
-                                applied_name,
-                                migration.name()
-                            ),
-                        )));
-                    }
-                } else {
-                    // Migration exists in database but not in code
-                    return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                        format!(
-                            "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
-                            Applied migrations cannot be removed from the codebase.",
-                            applied_version,
-                            applied_name
-                        ),
-                    )));
-                }
-            }
-
-            // Detect orphaned migrations (gaps in applied migrations with code present)
-            let applied_versions: Vec<u32> =
-                applied_migrations.iter().map(|(v, _, _)| *v).collect();
-            if !applied_versions.is_empty() {
-                let max_applied = *applied_versions.iter().max().unwrap();
-
-                for expected_version in 1..=max_applied {
-                    if !applied_versions.contains(&expected_version) {
-                        if let Some(missing_migration) = self
-                            .migrations()
-                            .iter()
-                            .find(|m| m.version() == expected_version)
-                        {
-                            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                                format!(
-                                    "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
-                                    This likely means migration {} was added after migration {} was already applied. \
-                                    Applied migrations: {:?}",
-                                    expected_version,
-                                    missing_migration.name(),
-                                    expected_version,
-                                    max_applied,
-                                    applied_versions
-                                ),
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Get current version
-        let current_version: u32 = {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT MAX(version) from {}",
-                self.schema_version_table_name()
-            ))?;
-            let version: Option<u32> = stmt.query_row([], |row| row.get(0))?;
-            version.unwrap_or(0)
-        };
-
-        // Validate target version
-        if target_version > current_version {
-            return Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
-                format!(
-                    "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
-                    target_version, current_version
-                ),
-            )));
-        }
-
-        // Get migrations to rollback (in reverse order)
-        let mut migrations_to_rollback = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > target_version && m.version() <= current_version)
-            .map(|x| (x.version(), x))
-            .collect::<Vec<_>>();
-        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.0)); // Reverse order
-
-        let mut migrations_run: Vec<u32> = Vec::new();
-        let mut failing_migration: Option<MigrationFailure> = None;
-
-        for (migration_version, migration) in migrations_to_rollback {
-            #[cfg(feature = "tracing")]
-            let _span = tracing::info_span!(
-                "migration_down",
-                version = migration_version,
-                name = %migration.name()
-            )
-            .entered();
-
-            #[cfg(feature = "tracing")]
-            tracing::info!("Rolling back migration");
-
-            // Call on_migration_start hook
-            if let Some(ref callback) = self.migrator.on_migration_start {
-                callback(migration_version, &migration.name());
-            }
-
-            let migration_start = Instant::now();
-
-            // Start a transaction for this migration rollback
-            let tx = conn.transaction()?;
-            let migration_result = migration.sqlite_down(&tx);
-
-            match migration_result {
-                Ok(_) => {
-                    // Commit the transaction
-                    tx.commit()?;
-
-                    let migration_duration = migration_start.elapsed();
-
-                    #[cfg(feature = "tracing")]
-                    tracing::info!(
-                        duration_ms = migration_duration.as_millis(),
-                        "Migration rolled back successfully"
-                    );
-
-                    // Delete this migration from the tracking table
-                    conn.execute(
-                        &format!(
-                            "DELETE FROM {} WHERE version = ?1",
-                            self.schema_version_table_name()
-                        ),
-                        params![migration_version],
-                    )?;
-
-                    // record migration as rolled back
-                    migrations_run.push(migration_version);
-
-                    // Call on_migration_complete hook
-                    if let Some(ref callback) = self.migrator.on_migration_complete {
-                        callback(migration_version, &migration.name(), migration_duration);
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(
-                        error = %e,
-                        "Migration rollback failed"
-                    );
-
-                    // Call on_migration_error hook
-                    if let Some(ref callback) = self.migrator.on_migration_error {
-                        callback(migration_version, &migration.name(), &e);
-                    }
-
-                    // Transaction will be automatically rolled back when dropped
-                    failing_migration = Some(MigrationFailure {
-                        migration,
-                        error: e,
-                    });
-                    break;
-                }
-            }
-        }
-
-        Ok(MigrationReport {
-            schema_version_table_existed,
-            schema_version_table_created: false,
-            failing_migration,
-            migrations_run,
-        })
+        self.migrator
+            .generic_downgrade::<SqliteBackend>(conn, target_version)
     }
 }
 
