@@ -65,21 +65,251 @@
 //! let report = migrator.upgrade(&mut client).unwrap();
 //! ```
 
-use crate::core::GenericMigrator;
+use crate::core::{AppliedMigrationRow, GenericMigrator, MigrationBackend, MigrationType};
 use crate::error::Error;
 use crate::AppliedMigration;
 use crate::Migration;
-use crate::MigrationFailure;
 use crate::MigrationReport;
-use crate::MigrationType;
 use crate::Precondition;
 use chrono::Utc;
 use postgres::Client;
-use std::time::Instant;
 
 // Re-export postgres types for use in migrations
 pub use postgres::Client as PostgresClient;
 pub use postgres::Transaction as PostgresTransaction;
+
+/// PostgreSQL-specific backend implementing the MigrationBackend trait.
+pub(crate) struct PostgresBackend;
+
+impl MigrationBackend for PostgresBackend {
+    type Conn = Client;
+
+    fn version_table_exists(conn: &mut Client, table_name: &str) -> Result<bool, Error> {
+        let exists: bool = conn
+            .query_one(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
+                &[&table_name],
+            )?
+            .get(0);
+        Ok(exists)
+    }
+
+    fn create_version_table(conn: &mut Client, table_name: &str) -> Result<(), Error> {
+        conn.execute(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {} (
+                    version INTEGER PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    migration_type TEXT NOT NULL DEFAULT 'migration'
+                )",
+                table_name
+            ),
+            &[],
+        )?;
+        Ok(())
+    }
+
+    fn column_exists(
+        conn: &mut Client,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<bool, Error> {
+        let exists: bool = conn
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2)",
+                &[&table_name, &column_name],
+            )?
+            .get(0);
+        Ok(exists)
+    }
+
+    fn add_column(
+        conn: &mut Client,
+        table_name: &str,
+        column_name: &str,
+        column_def: &str,
+    ) -> Result<(), Error> {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                table_name, column_name, column_def
+            ),
+            &[],
+        )?;
+        Ok(())
+    }
+
+    fn get_applied_migration_rows(
+        conn: &mut Client,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigrationRow>, Error> {
+        let rows = conn.query(
+            &format!("SELECT version, name, checksum FROM {}", table_name),
+            &[],
+        )?;
+        let result = rows
+            .into_iter()
+            .map(|row| {
+                let version: i32 = row.get(0);
+                Ok(AppliedMigrationRow {
+                    version: version as u32,
+                    name: row.get(1),
+                    checksum: row.get(2),
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(result)
+    }
+
+    fn get_max_version(conn: &mut Client, table_name: &str) -> Result<u32, Error> {
+        let row = conn.query_one(
+            &format!("SELECT COALESCE(MAX(version), 0) FROM {}", table_name),
+            &[],
+        )?;
+        let version: i32 = row.get(0);
+        Ok(version as u32)
+    }
+
+    fn get_migration_history_rows(
+        conn: &mut Client,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigration>, Error> {
+        // Check whether the migration_type column exists for backwards compatibility
+        let has_migration_type: bool = conn
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'migration_type')",
+                &[&table_name],
+            )?
+            .get(0);
+
+        let rows = if has_migration_type {
+            conn.query(
+                &format!(
+                    "SELECT version, name, applied_at, checksum, migration_type FROM {} ORDER BY version",
+                    table_name
+                ),
+                &[],
+            )?
+        } else {
+            conn.query(
+                &format!(
+                    "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
+                    table_name
+                ),
+                &[],
+            )?
+        };
+
+        let migrations = rows
+            .into_iter()
+            .map(|row| {
+                let version: i32 = row.get(0);
+                let name: String = row.get(1);
+                let applied_at_str: String = row.get(2);
+                let checksum: String = row.get(3);
+
+                let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
+                    .map_err(|e| Error::Generic(format!("Failed to parse datetime: {}", e)))?
+                    .with_timezone(&Utc);
+
+                let migration_type = if has_migration_type {
+                    let migration_type_str: String = row.get(4);
+                    if migration_type_str == "baseline" {
+                        MigrationType::Baseline
+                    } else {
+                        MigrationType::Migration
+                    }
+                } else {
+                    MigrationType::Migration
+                };
+
+                Ok(AppliedMigration {
+                    version: version as u32,
+                    name,
+                    applied_at,
+                    checksum,
+                    migration_type,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(migrations)
+    }
+
+    fn execute_migration_up(
+        conn: &mut Client,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+        applied_at: &str,
+        checksum: &str,
+        migration_type: MigrationType,
+    ) -> Result<bool, Error> {
+        // Start a transaction for this migration
+        let mut tx = conn.transaction()?;
+
+        // Check precondition
+        let precondition = migration.postgres_precondition(&mut tx)?;
+
+        match precondition {
+            Precondition::AlreadySatisfied => {
+                // Stamp the migration without running up(), then commit
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {} (version, name, applied_at, checksum, migration_type) VALUES($1, $2, $3, $4, $5)",
+                        table_name
+                    ),
+                    &[
+                        &(migration.version() as i32),
+                        &migration.name(),
+                        &applied_at,
+                        &checksum,
+                        &migration_type.to_string(),
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(false)
+            }
+            Precondition::NeedsApply => {
+                migration.postgres_up(&mut tx)?;
+                // Insert version row inside the same transaction (atomic with migration)
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {} (version, name, applied_at, checksum, migration_type) VALUES($1, $2, $3, $4, $5)",
+                        table_name
+                    ),
+                    &[
+                        &(migration.version() as i32),
+                        &migration.name(),
+                        &applied_at,
+                        &checksum,
+                        &migration_type.to_string(),
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn execute_migration_down(
+        conn: &mut Client,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+    ) -> Result<(), Error> {
+        // Start a transaction for this migration rollback
+        let mut tx = conn.transaction()?;
+        migration.postgres_down(&mut tx)?;
+        // Delete version row inside the same transaction (atomic with rollback)
+        tx.execute(
+            &format!("DELETE FROM {} WHERE version = $1", table_name),
+            &[&(migration.version() as i32)],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
 
 /// The entrypoint for running a sequence of [Migration]s on a PostgreSQL database.
 /// Construct this struct with the list of all [Migration]s to be applied.
@@ -173,28 +403,7 @@ impl PostgresMigrator {
     /// Get the current migration version from the database.
     /// Returns 0 if no migrations have been applied.
     pub fn get_current_version(&self, client: &mut Client) -> Result<u32, Error> {
-        // Check if schema version table exists
-        let table_exists: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-                &[&self.schema_version_table_name()],
-            )?
-            .get(0);
-
-        if !table_exists {
-            return Ok(0);
-        }
-
-        // Get current version (highest version number)
-        let row = client.query_one(
-            &format!(
-                "SELECT COALESCE(MAX(version), 0) FROM {}",
-                self.schema_version_table_name()
-            ),
-            &[],
-        )?;
-        let version: i32 = row.get(0);
-        Ok(version as u32)
+        self.migrator.generic_get_current_version::<PostgresBackend>(client)
     }
 
     /// Get the history of all migrations that have been applied to the database.
@@ -204,65 +413,13 @@ impl PostgresMigrator {
         &self,
         client: &mut Client,
     ) -> Result<Vec<AppliedMigration>, Error> {
-        // Check if schema version table exists
-        let table_exists: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-                &[&self.schema_version_table_name()],
-            )?
-            .get(0);
-
-        if !table_exists {
-            return Ok(vec![]);
-        }
-
-        // Query all applied migrations, ordered by version
-        let rows = client.query(
-            &format!(
-                "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
-                self.schema_version_table_name()
-            ),
-            &[],
-        )?;
-
-        let migrations: Result<Vec<AppliedMigration>, Error> = rows
-            .into_iter()
-            .map(|row| {
-                let version: i32 = row.get(0);
-                let name: String = row.get(1);
-                let applied_at_str: String = row.get(2);
-                let checksum: String = row.get(3);
-
-                let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
-                    .map_err(|e| Error::Generic(format!("Failed to parse datetime: {}", e)))?
-                    .with_timezone(&Utc);
-
-                Ok(AppliedMigration {
-                    version: version as u32,
-                    name,
-                    applied_at,
-                    checksum,
-                    migration_type: MigrationType::Migration,
-                })
-            })
-            .collect();
-
-        migrations
+        self.migrator.generic_get_migration_history::<PostgresBackend>(client)
     }
 
     /// Preview which migrations would be applied by `upgrade()` without actually running them.
     /// Returns a list of migrations that would be executed, in the order they would run.
     pub fn preview_upgrade(&self, client: &mut Client) -> Result<Vec<&Box<dyn Migration>>, Error> {
-        let current_version = self.get_current_version(client)?;
-
-        let mut pending_migrations = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > current_version)
-            .collect::<Vec<_>>();
-        pending_migrations.sort_by_key(|m| m.version());
-
-        Ok(pending_migrations)
+        self.migrator.generic_preview_upgrade::<PostgresBackend>(client)
     }
 
     /// Preview which migrations would be rolled back by `downgrade(target_version)` without actually running them.
@@ -272,24 +429,8 @@ impl PostgresMigrator {
         client: &mut Client,
         target_version: u32,
     ) -> Result<Vec<&Box<dyn Migration>>, Error> {
-        let current_version = self.get_current_version(client)?;
-
-        // Validate target version
-        if target_version > current_version {
-            return Err(Error::Generic(format!(
-                "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
-                target_version, current_version
-            )));
-        }
-
-        let mut migrations_to_rollback = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > target_version && m.version() <= current_version)
-            .collect::<Vec<_>>();
-        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.version())); // Reverse order
-
-        Ok(migrations_to_rollback)
+        self.migrator
+            .generic_preview_downgrade::<PostgresBackend>(client, target_version)
     }
 
     /// Upgrade the database to a specific target version.
@@ -314,315 +455,13 @@ impl PostgresMigrator {
             )));
         }
 
-        self.upgrade_internal(client, Some(target_version))
+        self.migrator
+            .generic_upgrade::<PostgresBackend>(client, Some(target_version))
     }
 
     /// Upgrade the database by running all pending migrations.
     pub fn upgrade(&self, client: &mut Client) -> Result<MigrationReport<'_>, Error> {
-        self.upgrade_internal(client, None)
-    }
-
-    fn upgrade_internal(
-        &self,
-        client: &mut Client,
-        target_version: Option<u32>,
-    ) -> Result<MigrationReport<'_>, Error> {
-        // Check if schema version tracking table exists
-        let schema_version_table_existed: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-                &[&self.schema_version_table_name()],
-            )?
-            .get(0);
-
-        if !schema_version_table_existed {
-            #[cfg(feature = "tracing")]
-            tracing::info!(
-                "Creating migration tracking table: {}",
-                self.schema_version_table_name()
-            );
-
-            // Create table with name and checksum columns
-            client.execute(
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS {} (
-                        version INTEGER PRIMARY KEY NOT NULL,
-                        name TEXT NOT NULL,
-                        applied_at TEXT NOT NULL,
-                        checksum TEXT NOT NULL
-                    )",
-                    self.schema_version_table_name()
-                ),
-                &[],
-            )?;
-        }
-
-        // Validate checksums of previously-applied migrations
-        if schema_version_table_existed {
-            // Check if the checksum column exists (for backwards compatibility)
-            let has_checksum_column: bool = client
-                .query_one(
-                    "SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'checksum')",
-                    &[&self.schema_version_table_name()],
-                )?
-                .get(0);
-
-            if has_checksum_column {
-                // Get all applied migrations with their checksums
-                let applied_migrations = client.query(
-                    &format!(
-                        "SELECT version, name, checksum FROM {}",
-                        self.schema_version_table_name()
-                    ),
-                    &[],
-                )?;
-
-                // Verify checksums match for migrations that were already applied
-                // Also detect missing migrations (in DB but not in code)
-                for row in &applied_migrations {
-                    let applied_version: i32 = row.get(0);
-                    let applied_name: String = row.get(1);
-                    let applied_checksum: String = row.get(2);
-
-                    if let Some(migration) = self
-                        .migrations()
-                        .iter()
-                        .find(|m| m.version() == applied_version as u32)
-                    {
-                        let current_checksum = GenericMigrator::calculate_checksum(migration);
-                        if current_checksum != applied_checksum {
-                            return Err(Error::Generic(format!(
-                                "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                                Migration name in DB: '{}', current name: '{}'. \
-                                This indicates the migration was modified after being applied.",
-                                applied_version,
-                                applied_checksum,
-                                current_checksum,
-                                applied_name,
-                                migration.name()
-                            )));
-                        }
-                    } else {
-                        // Migration exists in database but not in code - this is a missing migration
-                        return Err(Error::Generic(format!(
-                            "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
-                            Applied migrations cannot be removed from the codebase.",
-                            applied_version,
-                            applied_name
-                        )));
-                    }
-                }
-
-                // Detect orphaned migrations (in code but applied migrations are not contiguous)
-                let applied_versions: Vec<i32> =
-                    applied_migrations.iter().map(|row| row.get(0)).collect();
-                if !applied_versions.is_empty() {
-                    let max_applied = *applied_versions.iter().max().unwrap();
-
-                    // Check if all migrations up to max_applied exist in the database
-                    for expected_version in 1..=max_applied {
-                        if !applied_versions.contains(&expected_version) {
-                            // There's a gap - check if this migration exists in our code
-                            if let Some(missing_migration) = self
-                                .migrations()
-                                .iter()
-                                .find(|m| m.version() == expected_version as u32)
-                            {
-                                return Err(Error::Generic(format!(
-                                    "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
-                                    This likely means migration {} was added after migration {} was already applied. \
-                                    Applied migrations: {:?}",
-                                    expected_version,
-                                    missing_migration.name(),
-                                    expected_version,
-                                    max_applied,
-                                    applied_versions
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Get current migration version (highest version number)
-        let current_version = self.get_current_version(client)?;
-
-        // Iterate through migrations, run those that haven't been run
-        let mut migrations_run: Vec<u32> = Vec::new();
-        let mut migrations_sorted = self
-            .migrations()
-            .iter()
-            .map(|x| (x.version(), x))
-            .collect::<Vec<_>>();
-        migrations_sorted.sort_by_key(|m| m.0);
-        let mut failing_migration: Option<MigrationFailure> = None;
-        let mut schema_version_table_created = false;
-        // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
-        let batch_applied_at = Utc::now().to_rfc3339();
-
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            current_version = current_version,
-            target_version = ?target_version,
-            available_migrations = ?migrations_sorted.iter().map(|(v, m)| (*v, m.name())).collect::<Vec<_>>(),
-            "Considering migrations to run"
-        );
-
-        for (migration_version, migration) in migrations_sorted {
-            // Stop if we've reached the target version (if specified)
-            if let Some(target) = target_version {
-                if migration_version > target {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        migration_version = migration_version,
-                        target_version = target,
-                        "Skipping migration (beyond target version)"
-                    );
-                    break;
-                }
-            }
-
-            if current_version < migration_version {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    migration_version = migration_version,
-                    migration_name = %migration.name(),
-                    "Migration needs to be applied"
-                );
-                #[cfg(feature = "tracing")]
-                let _span = tracing::info_span!(
-                    "postgres_migration_up",
-                    version = migration_version,
-                    name = %migration.name()
-                )
-                .entered();
-
-                #[cfg(feature = "tracing")]
-                tracing::info!("Starting migration");
-
-                // Call on_migration_start hook
-                if let Some(ref callback) = self.migrator.on_migration_start {
-                    callback(migration_version, &migration.name());
-                }
-
-                let migration_start = Instant::now();
-
-                // Start a transaction for this migration
-                let mut tx = client.transaction()?;
-
-                // Check precondition
-                let precondition = match migration.postgres_precondition(&mut tx) {
-                    Ok(p) => p,
-                    Err(error) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            error = %error,
-                            "Precondition check failed"
-                        );
-
-                        // Call on_migration_error hook
-                        if let Some(ref callback) = self.migrator.on_migration_error {
-                            callback(migration_version, &migration.name(), &error);
-                        }
-
-                        failing_migration = Some(MigrationFailure { migration, error });
-                        break;
-                    }
-                };
-
-                // Run migration or stamp if precondition is satisfied
-                let migration_result = match precondition {
-                    Precondition::AlreadySatisfied => {
-                        #[cfg(feature = "tracing")]
-                        tracing::info!("Precondition already satisfied, stamping migration without running up()");
-
-                        // Call on_migration_skipped hook
-                        if let Some(ref callback) = self.migrator.on_migration_skipped {
-                            callback(migration_version, &migration.name());
-                        }
-
-                        Ok(())
-                    }
-                    Precondition::NeedsApply => {
-                        // Run the migration within the transaction
-                        migration.postgres_up(&mut tx)
-                    }
-                };
-
-                match migration_result {
-                    Ok(_) => {
-                        // Calculate checksum for this migration
-                        let checksum = GenericMigrator::calculate_checksum(migration);
-
-                        // Insert a row for this migration with its name, timestamp, and checksum
-                        tx.execute(
-                            &format!(
-                                "INSERT INTO {} (version, name, applied_at, checksum) VALUES($1, $2, $3, $4)",
-                                self.schema_version_table_name()
-                            ),
-                            &[&(migration_version as i32), &migration.name(), &batch_applied_at, &checksum],
-                        )?;
-
-                        // Commit the transaction
-                        tx.commit()?;
-
-                        let migration_duration = migration_start.elapsed();
-
-                        #[cfg(feature = "tracing")]
-                        tracing::info!(
-                            duration_ms = migration_duration.as_millis(),
-                            "Migration completed successfully"
-                        );
-
-                        // Record migration as run
-                        migrations_run.push(migration_version);
-                        // Also, since any migration succeeded, if schema version table had not originally existed,
-                        // we can mark that it was created
-                        schema_version_table_created = true;
-
-                        // Call on_migration_complete hook
-                        if let Some(ref callback) = self.migrator.on_migration_complete {
-                            callback(migration_version, &migration.name(), migration_duration);
-                        }
-                    }
-                    Err(e) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            error = %e,
-                            "Migration failed"
-                        );
-
-                        // Call on_migration_error hook
-                        if let Some(ref callback) = self.migrator.on_migration_error {
-                            callback(migration_version, &migration.name(), &e);
-                        }
-
-                        // Transaction will be automatically rolled back when dropped
-                        failing_migration = Some(MigrationFailure {
-                            migration,
-                            error: e,
-                        });
-                        break;
-                    }
-                }
-            } else {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    migration_version = migration_version,
-                    current_version = current_version,
-                    "Skipping migration (already applied)"
-                );
-            }
-        }
-
-        // Return report
-        Ok(MigrationReport {
-            schema_version_table_existed,
-            schema_version_table_created,
-            failing_migration,
-            migrations_run,
-        })
+        self.migrator.generic_upgrade::<PostgresBackend>(client, None)
     }
 
     /// Rollback migrations down to the specified target version.
@@ -634,211 +473,8 @@ impl PostgresMigrator {
         client: &mut Client,
         target_version: u32,
     ) -> Result<MigrationReport<'_>, Error> {
-        // Check if schema version table exists
-        let schema_version_table_existed: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-                &[&self.schema_version_table_name()],
-            )?
-            .get(0);
-
-        if !schema_version_table_existed {
-            // No migrations have been applied yet
-            return Ok(MigrationReport {
-                schema_version_table_existed: false,
-                schema_version_table_created: false,
-                failing_migration: None,
-                migrations_run: vec![],
-            });
-        }
-
-        // Validate checksums of previously-applied migrations (same as upgrade)
-        let has_checksum_column: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'checksum')",
-                &[&self.schema_version_table_name()],
-            )?
-            .get(0);
-
-        if has_checksum_column {
-            let applied_migrations = client.query(
-                &format!(
-                    "SELECT version, name, checksum FROM {}",
-                    self.schema_version_table_name()
-                ),
-                &[],
-            )?;
-
-            // Verify checksums and detect missing migrations
-            for row in &applied_migrations {
-                let applied_version: i32 = row.get(0);
-                let applied_name: String = row.get(1);
-                let applied_checksum: String = row.get(2);
-
-                if let Some(migration) = self
-                    .migrations()
-                    .iter()
-                    .find(|m| m.version() == applied_version as u32)
-                {
-                    let current_checksum = GenericMigrator::calculate_checksum(migration);
-                    if current_checksum != applied_checksum {
-                        return Err(Error::Generic(format!(
-                            "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                            Migration name in DB: '{}', current name: '{}'. \
-                            This indicates the migration was modified after being applied.",
-                            applied_version,
-                            applied_checksum,
-                            current_checksum,
-                            applied_name,
-                            migration.name()
-                        )));
-                    }
-                } else {
-                    // Migration exists in database but not in code
-                    return Err(Error::Generic(format!(
-                        "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
-                        Applied migrations cannot be removed from the codebase.",
-                        applied_version,
-                        applied_name
-                    )));
-                }
-            }
-
-            // Detect orphaned migrations (gaps in applied migrations with code present)
-            let applied_versions: Vec<i32> =
-                applied_migrations.iter().map(|row| row.get(0)).collect();
-            if !applied_versions.is_empty() {
-                let max_applied = *applied_versions.iter().max().unwrap();
-
-                for expected_version in 1..=max_applied {
-                    if !applied_versions.contains(&expected_version) {
-                        if let Some(missing_migration) = self
-                            .migrations()
-                            .iter()
-                            .find(|m| m.version() == expected_version as u32)
-                        {
-                            return Err(Error::Generic(format!(
-                                "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
-                                This likely means migration {} was added after migration {} was already applied. \
-                                Applied migrations: {:?}",
-                                expected_version,
-                                missing_migration.name(),
-                                expected_version,
-                                max_applied,
-                                applied_versions
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Get current version
-        let current_version = self.get_current_version(client)?;
-
-        // Validate target version
-        if target_version > current_version {
-            return Err(Error::Generic(format!(
-                "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
-                target_version, current_version
-            )));
-        }
-
-        // Get migrations to rollback (in reverse order)
-        let mut migrations_to_rollback = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > target_version && m.version() <= current_version)
-            .map(|x| (x.version(), x))
-            .collect::<Vec<_>>();
-        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.0)); // Reverse order
-
-        let mut migrations_run: Vec<u32> = Vec::new();
-        let mut failing_migration: Option<MigrationFailure> = None;
-
-        for (migration_version, migration) in migrations_to_rollback {
-            #[cfg(feature = "tracing")]
-            let _span = tracing::info_span!(
-                "postgres_migration_down",
-                version = migration_version,
-                name = %migration.name()
-            )
-            .entered();
-
-            #[cfg(feature = "tracing")]
-            tracing::info!("Rolling back migration");
-
-            // Call on_migration_start hook
-            if let Some(ref callback) = self.migrator.on_migration_start {
-                callback(migration_version, &migration.name());
-            }
-
-            let migration_start = Instant::now();
-
-            // Start a transaction for this migration rollback
-            let mut tx = client.transaction()?;
-
-            // Run the downgrade within the transaction
-            let migration_result = migration.postgres_down(&mut tx);
-
-            match migration_result {
-                Ok(_) => {
-                    // Delete this migration from the tracking table
-                    tx.execute(
-                        &format!(
-                            "DELETE FROM {} WHERE version = $1",
-                            self.schema_version_table_name()
-                        ),
-                        &[&(migration_version as i32)],
-                    )?;
-
-                    // Commit the transaction
-                    tx.commit()?;
-
-                    let migration_duration = migration_start.elapsed();
-
-                    #[cfg(feature = "tracing")]
-                    tracing::info!(
-                        duration_ms = migration_duration.as_millis(),
-                        "Migration rolled back successfully"
-                    );
-
-                    // Record migration as rolled back
-                    migrations_run.push(migration_version);
-
-                    // Call on_migration_complete hook
-                    if let Some(ref callback) = self.migrator.on_migration_complete {
-                        callback(migration_version, &migration.name(), migration_duration);
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(
-                        error = %e,
-                        "Migration rollback failed"
-                    );
-
-                    // Call on_migration_error hook
-                    if let Some(ref callback) = self.migrator.on_migration_error {
-                        callback(migration_version, &migration.name(), &e);
-                    }
-
-                    // Transaction will be automatically rolled back when dropped
-                    failing_migration = Some(MigrationFailure {
-                        migration,
-                        error: e,
-                    });
-                    break;
-                }
-            }
-        }
-
-        Ok(MigrationReport {
-            schema_version_table_existed,
-            schema_version_table_created: false,
-            failing_migration,
-            migrations_run,
-        })
+        self.migrator
+            .generic_downgrade::<PostgresBackend>(client, target_version)
     }
 }
 
