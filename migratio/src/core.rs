@@ -96,8 +96,15 @@ pub trait Migration {
     ///
     /// - Must be greater than 0
     /// - Must be unique across all migrations
-    /// - Must be contiguous (1, 2, 3, ... with no gaps)
+    /// - Must be contiguous with other migrations (N, N+1, N+2, ...) but N does not have to be 1
     /// - Must be immutable once the migration is applied to any database
+    ///
+    /// # Baseline migrations
+    ///
+    /// If the first migration's version is greater than 1, it is treated as a **baseline**
+    /// migration. A baseline represents a compacted snapshot of all schema changes prior to that
+    /// version. When applied to a fresh database, it is recorded with `MigrationType::Baseline`.
+    /// Downgrading below the baseline version is not permitted.
     fn version(&self) -> u32;
 
     /// Returns the name of this migration.
@@ -473,25 +480,24 @@ impl GenericMigrator {
             }
         }
 
-        // Check for contiguity (versions must be 1, 2, 3, ...)
+        // Check for contiguity: versions must be N, N+1, N+2, ... for some N >= 1
         if !versions.is_empty() {
-            if versions[0] != 1 {
-                return Err(format!(
-                    "Migration versions must start at 1, found starting version: {}",
-                    versions[0]
-                ));
-            }
-
-            for (i, &version) in versions.iter().enumerate() {
-                let expected = (i + 1) as u32;
-                if version != expected {
+            for i in 1..versions.len() {
+                if versions[i] != versions[i - 1] + 1 {
                     return Err(format!(
-                        "Migration versions must be contiguous. Expected version {}, found {}",
-                        expected, version
+                        "Migration versions must be contiguous. Found gap between version {} and {}",
+                        versions[i - 1], versions[i]
                     ));
                 }
             }
         }
+
+        // Derive baseline_version: if the first migration version is > 1, it is a baseline
+        let baseline_version = if !versions.is_empty() && versions[0] > 1 {
+            Some(versions[0])
+        } else {
+            None
+        };
 
         Ok(Self {
             migrations,
@@ -500,7 +506,7 @@ impl GenericMigrator {
             on_migration_complete: None,
             on_migration_skipped: None,
             on_migration_error: None,
-            baseline_version: None,
+            baseline_version,
         })
     }
 
@@ -624,8 +630,30 @@ impl GenericMigrator {
             if has_checksum {
                 let applied_rows = B::get_applied_migration_rows(conn, table_name)?;
 
+                // Check if the DB is below the baseline version (if baseline is set)
+                if let Some(bv) = self.baseline_version {
+                    let applied_versions: Vec<u32> =
+                        applied_rows.iter().map(|r| r.version).collect();
+                    if !applied_versions.is_empty() {
+                        let max_applied = *applied_versions.iter().max().unwrap();
+                        if max_applied > 0 && max_applied < bv {
+                            return Err(Error::Generic(format!(
+                                "Database is at version {} which is below baseline version {}. Manual intervention required.",
+                                max_applied, bv
+                            )));
+                        }
+                    }
+                }
+
                 // Verify checksums and detect missing migrations
+                // Skip versions at or below the baseline — those are pre-compaction history
                 for row in &applied_rows {
+                    if let Some(bv) = self.baseline_version {
+                        if row.version <= bv {
+                            continue;
+                        }
+                    }
+
                     if let Some(migration) = self
                         .migrations
                         .iter()
@@ -655,10 +683,18 @@ impl GenericMigrator {
                 }
 
                 // Detect orphaned migrations (gaps in applied versions with code present)
+                // Only check from the first code-defined version onwards; versions below
+                // baseline are expected leftovers from before compaction.
                 let applied_versions: Vec<u32> = applied_rows.iter().map(|r| r.version).collect();
                 if !applied_versions.is_empty() {
                     let max_applied = *applied_versions.iter().max().unwrap();
-                    for expected_version in 1..=max_applied {
+                    let first_code_version = self
+                        .migrations
+                        .iter()
+                        .map(|m| m.version())
+                        .min()
+                        .unwrap_or(1);
+                    for expected_version in first_code_version..=max_applied {
                         if !applied_versions.contains(&expected_version) {
                             if let Some(missing_migration) = self
                                 .migrations
@@ -745,13 +781,21 @@ impl GenericMigrator {
 
                 let migration_start = std::time::Instant::now();
 
+                // Use Baseline migration type when running the baseline migration on a fresh DB
+                let migration_type =
+                    if self.baseline_version == Some(migration_version) && current_version == 0 {
+                        MigrationType::Baseline
+                    } else {
+                        MigrationType::Migration
+                    };
+
                 let migration_result = B::execute_migration_up(
                     conn,
                     migration,
                     table_name,
                     &batch_applied_at,
                     &Self::calculate_checksum(migration),
-                    MigrationType::Migration,
+                    migration_type,
                 );
 
                 match migration_result {
@@ -850,7 +894,14 @@ impl GenericMigrator {
             let applied_rows = B::get_applied_migration_rows(conn, table_name)?;
 
             // Verify checksums and detect missing migrations
+            // Skip versions at or below the baseline — those are pre-compaction history
             for row in &applied_rows {
+                if let Some(bv) = self.baseline_version {
+                    if row.version <= bv {
+                        continue;
+                    }
+                }
+
                 if let Some(migration) = self
                     .migrations
                     .iter()
@@ -880,10 +931,17 @@ impl GenericMigrator {
             }
 
             // Detect orphaned migrations
+            // Only check from the first code-defined version onwards
             let applied_versions: Vec<u32> = applied_rows.iter().map(|r| r.version).collect();
             if !applied_versions.is_empty() {
                 let max_applied = *applied_versions.iter().max().unwrap();
-                for expected_version in 1..=max_applied {
+                let first_code_version = self
+                    .migrations
+                    .iter()
+                    .map(|m| m.version())
+                    .min()
+                    .unwrap_or(1);
+                for expected_version in first_code_version..=max_applied {
                     if !applied_versions.contains(&expected_version) {
                         if let Some(missing_migration) = self
                             .migrations
@@ -908,6 +966,16 @@ impl GenericMigrator {
 
         // Get current version
         let current_version = B::get_max_version(conn, table_name)?;
+
+        // Cannot downgrade below the baseline version
+        if let Some(bv) = self.baseline_version {
+            if target_version < bv {
+                return Err(Error::Generic(format!(
+                    "Cannot downgrade below baseline version {}. The baseline migration represents a compacted state that cannot be rolled back.",
+                    bv
+                )));
+            }
+        }
 
         // Validate target version
         if target_version > current_version {
@@ -1044,6 +1112,16 @@ impl GenericMigrator {
         conn: &mut B::Conn,
         target_version: u32,
     ) -> Result<Vec<&Box<dyn Migration>>, Error> {
+        // Cannot preview downgrade below the baseline version
+        if let Some(bv) = self.baseline_version {
+            if target_version < bv {
+                return Err(Error::Generic(format!(
+                    "Cannot downgrade below baseline version {}.",
+                    bv
+                )));
+            }
+        }
+
         let current_version = self.generic_get_current_version::<B>(conn)?;
 
         if target_version > current_version {

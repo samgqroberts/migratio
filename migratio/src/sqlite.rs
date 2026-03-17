@@ -5907,4 +5907,76 @@ mod tests {
         harness.migrate_up_one().unwrap();
         assert_eq!(harness.current_version().unwrap(), 6);
     }
+
+    // --- Test 26: baseline migration with AlreadySatisfied precondition is still recorded as BASELINE ---
+
+    #[test]
+    fn test_baseline_precondition_already_satisfied_records_as_baseline() {
+        // This tests the case where the baseline migration's precondition returns AlreadySatisfied
+        // (e.g., schema already exists when adopting migratio on an existing database).
+        // The baseline migration should still be recorded as MigrationType::Baseline.
+
+        struct BaselineWithPrecondition;
+        impl Migration for BaselineWithPrecondition {
+            fn version(&self) -> u32 { 5 }
+            fn name(&self) -> String { "baseline_with_precondition".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE precond_t (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_precondition(&self, tx: &Transaction) -> Result<Precondition, Error> {
+                // Simulate: schema already exists, no need to run up()
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='precond_t'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if count > 0 {
+                    Ok(Precondition::AlreadySatisfied)
+                } else {
+                    Ok(Precondition::NeedsApply)
+                }
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        struct M6;
+        impl Migration for M6 {
+            fn version(&self) -> u32 { 6 }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE precond_t6 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Pre-create the table so the precondition returns AlreadySatisfied
+        conn.execute("CREATE TABLE precond_t (id INTEGER PRIMARY KEY)", []).unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineWithPrecondition),
+            Box::new(M6),
+        ]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+        // Both v5 (precondition satisfied) and v6 run
+        assert_eq!(report.migrations_run, vec![5, 6]);
+        assert!(report.failing_migration.is_none());
+
+        // v5 must be recorded as BASELINE even though precondition returned AlreadySatisfied
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].version, 5);
+        assert_eq!(
+            history[0].migration_type,
+            MigrationType::Baseline,
+            "baseline migration with AlreadySatisfied precondition must still be recorded as BASELINE"
+        );
+        assert_eq!(history[1].version, 6);
+        assert_eq!(history[1].migration_type, MigrationType::Migration);
+    }
 }
