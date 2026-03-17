@@ -1,10 +1,11 @@
 # migratio
 
-`migratio` is a lightweight library for managing database migrations.
+`migratio` is a library for managing database migrations.
 
 Core concepts:
-- `migratio` supplies migration definitions with a live connection to the database, allowing more expressive migration logic than just preparing SQL statements.
-- `migratio` is a code-first library, making embedding it in your application easier than other CLI-first libraries.
+
+- Live DB Connections: `migratio` supplies migration definitions with a live connection to the database, allowing more expressive migration logic than just preparing SQL statements.
+- Code-First: `migratio` is a code-first library, making embedding it in your application easier than other CLI-first libraries.
 
 ## Motivation
 
@@ -24,9 +25,8 @@ Note: [SeaORM](https://www.sea-ql.org/SeaORM/) allows this, but `migratio` aims 
 A central use case for `migratio` is embedding migration logic within an application, usually in the startup procedure.
 This way, when the application updates, the next time it starts the database will automatically be migrated to the latest version without any manual intervention.
 
-Anywhere you can construct a [SqliteMigrator](sqlite::SqliteMigrator) or [MysqlMigrator](mysql::MysqlMigrator) instance, you can access any feature this library provides.
-
 ## Benefits
+
 - Easy adoption from other migration tools or no migration tool.
 - Robust error handling and rollback support (when available).
 - Preview / dry-run support.
@@ -39,5 +39,6 @@ Anywhere you can construct a [SqliteMigrator](sqlite::SqliteMigrator) or [MysqlM
 
 - [`SQLite`](sqlite) - available with the `sqlite` feature flag.
 - [`MySQL`](mysql) - available with the `mysql` feature flag.
+- [`PostgresSQL`](postgres) - available with the `postgres` feature flag.
 
 License: MIT
