@@ -146,8 +146,8 @@ mod sqlite {
                     println!("Migration history:");
                     for entry in history {
                         println!(
-                            "  v{}: {} (applied {})",
-                            entry.version, entry.name, entry.applied_at
+                            "  v{}: {} [{}] (applied {})",
+                            entry.version, entry.name, entry.migration_type, entry.applied_at
                         );
                     }
                 }
@@ -247,8 +247,8 @@ mod mysql_support {
                     println!("Migration history:");
                     for entry in history {
                         println!(
-                            "  v{}: {} (applied {})",
-                            entry.version, entry.name, entry.applied_at
+                            "  v{}: {} [{}] (applied {})",
+                            entry.version, entry.name, entry.migration_type, entry.applied_at
                         );
                     }
                 }
@@ -341,8 +341,8 @@ mod postgres_support {
                     println!("Migration history:");
                     for entry in history {
                         println!(
-                            "  v{}: {} (applied {})",
-                            entry.version, entry.name, entry.applied_at
+                            "  v{}: {} [{}] (applied {})",
+                            entry.version, entry.name, entry.migration_type, entry.applied_at
                         );
                     }
                 }
