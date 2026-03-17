@@ -41,7 +41,9 @@
 //! - [`PostgreSQL`](postgres) - available with the `postgres` feature flag.
 
 mod core;
-pub use core::{AppliedMigration, Migration, MigrationFailure, MigrationReport, Precondition};
+pub use core::{
+    AppliedMigration, Migration, MigrationFailure, MigrationReport, MigrationType, Precondition,
+};
 
 mod error;
 pub use error::Error;

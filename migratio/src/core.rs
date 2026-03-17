@@ -39,6 +39,22 @@ pub enum Precondition {
     NeedsApply,
 }
 
+/// Represents the type of a migration entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationType {
+    Migration,
+    Baseline,
+}
+
+impl std::fmt::Display for MigrationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrationType::Migration => write!(f, "migration"),
+            MigrationType::Baseline => write!(f, "baseline"),
+        }
+    }
+}
+
 /// Represents a migration that has been applied to the database.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppliedMigration {
@@ -49,6 +65,15 @@ pub struct AppliedMigration {
     /// The timestamp when the migration was applied.
     pub applied_at: chrono::DateTime<Utc>,
     /// The checksum of the migration at the time it was applied.
+    pub checksum: String,
+    /// The type of this migration entry.
+    pub migration_type: MigrationType,
+}
+
+/// A row read from the version table before full parsing (no applied_at parsing needed for validation).
+pub(crate) struct AppliedMigrationRow {
+    pub version: u32,
+    pub name: String,
     pub checksum: String,
 }
 
@@ -348,6 +373,55 @@ impl std::fmt::Debug for dyn Migration {
     }
 }
 
+/// Backend trait for database-specific migration operations.
+/// Each backend handles its own connection type and transaction semantics.
+pub(crate) trait MigrationBackend {
+    type Conn;
+
+    // Table management
+    fn version_table_exists(conn: &mut Self::Conn, table_name: &str) -> Result<bool, Error>;
+    fn create_version_table(conn: &mut Self::Conn, table_name: &str) -> Result<(), Error>;
+    fn column_exists(
+        conn: &mut Self::Conn,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<bool, Error>;
+    fn add_column(
+        conn: &mut Self::Conn,
+        table_name: &str,
+        column_name: &str,
+        column_def: &str,
+    ) -> Result<(), Error>;
+
+    // Queries
+    fn get_applied_migration_rows(
+        conn: &mut Self::Conn,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigrationRow>, Error>;
+    fn get_max_version(conn: &mut Self::Conn, table_name: &str) -> Result<u32, Error>;
+    fn get_migration_history_rows(
+        conn: &mut Self::Conn,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigration>, Error>;
+
+    // High-level migration operations — each backend handles its own transaction semantics.
+    // Returns Ok(true) if migration was executed, Ok(false) if precondition was AlreadySatisfied.
+    fn execute_migration_up(
+        conn: &mut Self::Conn,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+        applied_at: &str,
+        checksum: &str,
+        migration_type: MigrationType,
+    ) -> Result<bool, Error>;
+
+    fn execute_migration_down(
+        conn: &mut Self::Conn,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+    ) -> Result<(), Error>;
+}
+
 /// Shared migrator logic between different database types.
 pub(crate) struct GenericMigrator {
     pub migrations: Vec<Box<dyn Migration>>,
@@ -356,6 +430,7 @@ pub(crate) struct GenericMigrator {
     pub on_migration_complete: Option<Box<dyn Fn(u32, &str, std::time::Duration) + Send + Sync>>,
     pub on_migration_skipped: Option<Box<dyn Fn(u32, &str) + Send + Sync>>,
     pub on_migration_error: Option<Box<dyn Fn(u32, &str, &Error) + Send + Sync>>,
+    pub baseline_version: Option<u32>,
 }
 
 // Manual Debug impl since closures don't implement Debug
@@ -371,6 +446,7 @@ impl std::fmt::Debug for GenericMigrator {
             )
             .field("on_migration_skipped", &self.on_migration_skipped.is_some())
             .field("on_migration_error", &self.on_migration_error.is_some())
+            .field("baseline_version", &self.baseline_version)
             .finish()
     }
 }
@@ -424,6 +500,7 @@ impl GenericMigrator {
             on_migration_complete: None,
             on_migration_skipped: None,
             on_migration_error: None,
+            baseline_version: None,
         })
     }
 
@@ -500,5 +577,488 @@ impl GenericMigrator {
         hasher.update(b"|");
         hasher.update(migration.name().as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    /// Generic upgrade logic shared across all backends.
+    pub(crate) fn generic_upgrade<B: MigrationBackend>(
+        &self,
+        conn: &mut B::Conn,
+        target_version: Option<u32>,
+    ) -> Result<MigrationReport<'_>, Error> {
+        let table_name = &self.schema_version_table_name;
+
+        // Check if the schema version table exists and create it if not
+        let schema_version_table_existed = B::version_table_exists(conn, table_name)?;
+        if !schema_version_table_existed {
+            #[cfg(feature = "tracing")]
+            tracing::info!("Creating migration tracking table: {}", table_name);
+            B::create_version_table(conn, table_name)?;
+        }
+        #[cfg(feature = "tracing")]
+        if schema_version_table_existed {
+            tracing::debug!("Migration tracking table '{}' exists", table_name);
+        }
+
+        // For backwards compatibility: add checksum column if it doesn't exist
+        if schema_version_table_existed {
+            let has_checksum = B::column_exists(conn, table_name, "checksum")?;
+            if !has_checksum {
+                B::add_column(conn, table_name, "checksum", "text not null default ''")?;
+            }
+
+            // For backwards compatibility: add migration_type column if it doesn't exist
+            let has_migration_type = B::column_exists(conn, table_name, "migration_type")?;
+            if !has_migration_type {
+                B::add_column(
+                    conn,
+                    table_name,
+                    "migration_type",
+                    "text not null default 'migration'",
+                )?;
+            }
+        }
+
+        // Validate checksums and detect missing/orphaned migrations
+        if schema_version_table_existed {
+            let has_checksum = B::column_exists(conn, table_name, "checksum")?;
+            if has_checksum {
+                let applied_rows = B::get_applied_migration_rows(conn, table_name)?;
+
+                // Verify checksums and detect missing migrations
+                for row in &applied_rows {
+                    if let Some(migration) = self
+                        .migrations
+                        .iter()
+                        .find(|m| m.version() == row.version)
+                    {
+                        let current_checksum = Self::calculate_checksum(migration);
+                        if current_checksum != row.checksum {
+                            return Err(Error::Generic(format!(
+                                "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
+                                Migration name in DB: '{}', current name: '{}'. \
+                                This indicates the migration was modified after being applied.",
+                                row.version,
+                                row.checksum,
+                                current_checksum,
+                                row.name,
+                                migration.name()
+                            )));
+                        }
+                    } else {
+                        return Err(Error::Generic(format!(
+                            "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
+                            Applied migrations cannot be removed from the codebase.",
+                            row.version,
+                            row.name
+                        )));
+                    }
+                }
+
+                // Detect orphaned migrations (gaps in applied versions with code present)
+                let applied_versions: Vec<u32> = applied_rows.iter().map(|r| r.version).collect();
+                if !applied_versions.is_empty() {
+                    let max_applied = *applied_versions.iter().max().unwrap();
+                    for expected_version in 1..=max_applied {
+                        if !applied_versions.contains(&expected_version) {
+                            if let Some(missing_migration) = self
+                                .migrations
+                                .iter()
+                                .find(|m| m.version() == expected_version)
+                            {
+                                return Err(Error::Generic(format!(
+                                    "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
+                                    This likely means migration {} was added after migration {} was already applied. \
+                                    Applied migrations: {:?}",
+                                    expected_version,
+                                    missing_migration.name(),
+                                    expected_version,
+                                    max_applied,
+                                    applied_versions
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Get current migration version (highest version number)
+        let current_version = B::get_max_version(conn, table_name)?;
+
+        // Iterate through migrations, run those that haven't been run
+        let mut migrations_run: Vec<u32> = Vec::new();
+        let mut migrations_sorted = self
+            .migrations
+            .iter()
+            .map(|x| (x.version(), x))
+            .collect::<Vec<_>>();
+        migrations_sorted.sort_by_key(|m| m.0);
+        let mut failing_migration: Option<MigrationFailure> = None;
+        let mut schema_version_table_created = false;
+        // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
+        let batch_applied_at = Utc::now().to_rfc3339();
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            current_version = current_version,
+            target_version = ?target_version,
+            available_migrations = ?migrations_sorted.iter().map(|(v, m)| (*v, m.name())).collect::<Vec<_>>(),
+            "Considering migrations to run"
+        );
+
+        for (migration_version, migration) in migrations_sorted {
+            // Stop if we've reached the target version (if specified)
+            if let Some(target) = target_version {
+                if migration_version > target {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        migration_version = migration_version,
+                        target_version = target,
+                        "Skipping migration (beyond target version)"
+                    );
+                    break;
+                }
+            }
+
+            if current_version < migration_version {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    migration_version = migration_version,
+                    migration_name = %migration.name(),
+                    "Migration needs to be applied"
+                );
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!(
+                    "migration_up",
+                    version = migration_version,
+                    name = %migration.name()
+                )
+                .entered();
+
+                #[cfg(feature = "tracing")]
+                tracing::info!("Starting migration");
+
+                // Call on_migration_start hook
+                if let Some(ref callback) = self.on_migration_start {
+                    callback(migration_version, &migration.name());
+                }
+
+                let migration_start = std::time::Instant::now();
+
+                let migration_result = B::execute_migration_up(
+                    conn,
+                    migration,
+                    table_name,
+                    &batch_applied_at,
+                    &Self::calculate_checksum(migration),
+                    MigrationType::Migration,
+                );
+
+                match migration_result {
+                    Ok(was_applied) => {
+                        let migration_duration = migration_start.elapsed();
+
+                        if was_applied {
+                            #[cfg(feature = "tracing")]
+                            tracing::info!(
+                                duration_ms = migration_duration.as_millis(),
+                                "Migration completed successfully"
+                            );
+                        } else {
+                            // Precondition was AlreadySatisfied
+                            #[cfg(feature = "tracing")]
+                            tracing::info!("Precondition already satisfied, stamping migration without running up()");
+
+                            // Call on_migration_skipped hook
+                            if let Some(ref callback) = self.on_migration_skipped {
+                                callback(migration_version, &migration.name());
+                            }
+                        }
+
+                        // Record migration as run regardless of whether it was applied or skipped
+                        migrations_run.push(migration_version);
+                        // Since any migration succeeded, if schema version table had not originally existed,
+                        // we can mark that it was created
+                        schema_version_table_created = true;
+
+                        // Call on_migration_complete hook
+                        if let Some(ref callback) = self.on_migration_complete {
+                            callback(migration_version, &migration.name(), migration_duration);
+                        }
+                    }
+                    Err(e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(
+                            error = %e,
+                            "Migration failed"
+                        );
+
+                        // Call on_migration_error hook
+                        if let Some(ref callback) = self.on_migration_error {
+                            callback(migration_version, &migration.name(), &e);
+                        }
+
+                        // Transaction will be automatically rolled back when dropped
+                        failing_migration = Some(MigrationFailure {
+                            migration,
+                            error: e,
+                        });
+                        break;
+                    }
+                }
+            } else {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    migration_version = migration_version,
+                    current_version = current_version,
+                    "Skipping migration (already applied)"
+                );
+            }
+        }
+
+        Ok(MigrationReport {
+            schema_version_table_existed,
+            schema_version_table_created,
+            failing_migration,
+            migrations_run,
+        })
+    }
+
+    /// Generic downgrade logic shared across all backends.
+    pub(crate) fn generic_downgrade<B: MigrationBackend>(
+        &self,
+        conn: &mut B::Conn,
+        target_version: u32,
+    ) -> Result<MigrationReport<'_>, Error> {
+        let table_name = &self.schema_version_table_name;
+
+        // Check if schema version table exists
+        let schema_version_table_existed = B::version_table_exists(conn, table_name)?;
+
+        if !schema_version_table_existed {
+            return Ok(MigrationReport {
+                schema_version_table_existed: false,
+                schema_version_table_created: false,
+                failing_migration: None,
+                migrations_run: vec![],
+            });
+        }
+
+        // Validate checksums of previously-applied migrations (same as upgrade)
+        let has_checksum = B::column_exists(conn, table_name, "checksum")?;
+        if has_checksum {
+            let applied_rows = B::get_applied_migration_rows(conn, table_name)?;
+
+            // Verify checksums and detect missing migrations
+            for row in &applied_rows {
+                if let Some(migration) = self
+                    .migrations
+                    .iter()
+                    .find(|m| m.version() == row.version)
+                {
+                    let current_checksum = Self::calculate_checksum(migration);
+                    if current_checksum != row.checksum {
+                        return Err(Error::Generic(format!(
+                            "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
+                            Migration name in DB: '{}', current name: '{}'. \
+                            This indicates the migration was modified after being applied.",
+                            row.version,
+                            row.checksum,
+                            current_checksum,
+                            row.name,
+                            migration.name()
+                        )));
+                    }
+                } else {
+                    return Err(Error::Generic(format!(
+                        "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
+                        Applied migrations cannot be removed from the codebase.",
+                        row.version,
+                        row.name
+                    )));
+                }
+            }
+
+            // Detect orphaned migrations
+            let applied_versions: Vec<u32> = applied_rows.iter().map(|r| r.version).collect();
+            if !applied_versions.is_empty() {
+                let max_applied = *applied_versions.iter().max().unwrap();
+                for expected_version in 1..=max_applied {
+                    if !applied_versions.contains(&expected_version) {
+                        if let Some(missing_migration) = self
+                            .migrations
+                            .iter()
+                            .find(|m| m.version() == expected_version)
+                        {
+                            return Err(Error::Generic(format!(
+                                "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
+                                This likely means migration {} was added after migration {} was already applied. \
+                                Applied migrations: {:?}",
+                                expected_version,
+                                missing_migration.name(),
+                                expected_version,
+                                max_applied,
+                                applied_versions
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Get current version
+        let current_version = B::get_max_version(conn, table_name)?;
+
+        // Validate target version
+        if target_version > current_version {
+            return Err(Error::Generic(format!(
+                "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
+                target_version, current_version
+            )));
+        }
+
+        // Get migrations to rollback (in reverse order)
+        let mut migrations_to_rollback = self
+            .migrations
+            .iter()
+            .filter(|m| m.version() > target_version && m.version() <= current_version)
+            .map(|x| (x.version(), x))
+            .collect::<Vec<_>>();
+        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.0));
+
+        let mut migrations_run: Vec<u32> = Vec::new();
+        let mut failing_migration: Option<MigrationFailure> = None;
+
+        for (migration_version, migration) in migrations_to_rollback {
+            #[cfg(feature = "tracing")]
+            let _span = tracing::info_span!(
+                "migration_down",
+                version = migration_version,
+                name = %migration.name()
+            )
+            .entered();
+
+            #[cfg(feature = "tracing")]
+            tracing::info!("Rolling back migration");
+
+            // Call on_migration_start hook
+            if let Some(ref callback) = self.on_migration_start {
+                callback(migration_version, &migration.name());
+            }
+
+            let migration_start = std::time::Instant::now();
+
+            let migration_result = B::execute_migration_down(conn, migration, table_name);
+
+            match migration_result {
+                Ok(_) => {
+                    let migration_duration = migration_start.elapsed();
+
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        duration_ms = migration_duration.as_millis(),
+                        "Migration rolled back successfully"
+                    );
+
+                    // Record migration as rolled back
+                    migrations_run.push(migration_version);
+
+                    // Call on_migration_complete hook
+                    if let Some(ref callback) = self.on_migration_complete {
+                        callback(migration_version, &migration.name(), migration_duration);
+                    }
+                }
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(
+                        error = %e,
+                        "Migration rollback failed"
+                    );
+
+                    // Call on_migration_error hook
+                    if let Some(ref callback) = self.on_migration_error {
+                        callback(migration_version, &migration.name(), &e);
+                    }
+
+                    failing_migration = Some(MigrationFailure {
+                        migration,
+                        error: e,
+                    });
+                    break;
+                }
+            }
+        }
+
+        Ok(MigrationReport {
+            schema_version_table_existed,
+            schema_version_table_created: false,
+            failing_migration,
+            migrations_run,
+        })
+    }
+
+    /// Generic get_current_version logic.
+    pub(crate) fn generic_get_current_version<B: MigrationBackend>(
+        &self,
+        conn: &mut B::Conn,
+    ) -> Result<u32, Error> {
+        let table_name = &self.schema_version_table_name;
+        let table_exists = B::version_table_exists(conn, table_name)?;
+        if !table_exists {
+            return Ok(0);
+        }
+        B::get_max_version(conn, table_name)
+    }
+
+    /// Generic get_migration_history logic.
+    pub(crate) fn generic_get_migration_history<B: MigrationBackend>(
+        &self,
+        conn: &mut B::Conn,
+    ) -> Result<Vec<AppliedMigration>, Error> {
+        let table_name = &self.schema_version_table_name;
+        let table_exists = B::version_table_exists(conn, table_name)?;
+        if !table_exists {
+            return Ok(vec![]);
+        }
+        B::get_migration_history_rows(conn, table_name)
+    }
+
+    /// Generic preview_upgrade logic.
+    pub(crate) fn generic_preview_upgrade<B: MigrationBackend>(
+        &self,
+        conn: &mut B::Conn,
+    ) -> Result<Vec<&Box<dyn Migration>>, Error> {
+        let current_version = self.generic_get_current_version::<B>(conn)?;
+        let mut pending_migrations = self
+            .migrations
+            .iter()
+            .filter(|m| m.version() > current_version)
+            .collect::<Vec<_>>();
+        pending_migrations.sort_by_key(|m| m.version());
+        Ok(pending_migrations)
+    }
+
+    /// Generic preview_downgrade logic.
+    pub(crate) fn generic_preview_downgrade<B: MigrationBackend>(
+        &self,
+        conn: &mut B::Conn,
+        target_version: u32,
+    ) -> Result<Vec<&Box<dyn Migration>>, Error> {
+        let current_version = self.generic_get_current_version::<B>(conn)?;
+
+        if target_version > current_version {
+            return Err(Error::Generic(format!(
+                "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
+                target_version, current_version
+            )));
+        }
+
+        let mut migrations_to_rollback = self
+            .migrations
+            .iter()
+            .filter(|m| m.version() > target_version && m.version() <= current_version)
+            .collect::<Vec<_>>();
+        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.version()));
+        Ok(migrations_to_rollback)
     }
 }

@@ -71,6 +71,7 @@ use crate::AppliedMigration;
 use crate::Migration;
 use crate::MigrationFailure;
 use crate::MigrationReport;
+use crate::MigrationType;
 use crate::Precondition;
 use chrono::Utc;
 use postgres::Client;
@@ -241,6 +242,7 @@ impl PostgresMigrator {
                     name,
                     applied_at,
                     checksum,
+                    migration_type: MigrationType::Migration,
                 })
             })
             .collect();
