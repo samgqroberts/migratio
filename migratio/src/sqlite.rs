@@ -4881,4 +4881,1030 @@ mod tests {
         let version = migrator.get_current_version(&mut conn).unwrap();
         assert_eq!(version, 3);
     }
+
+    // =========================================================================
+    // Baseline / compaction tests
+    // =========================================================================
+
+    // Helper: check whether a table exists in the DB
+    fn table_exists(conn: &Connection, table_name: &str) -> bool {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        count > 0
+    }
+
+    // Helper: insert a row into the migratio version table (without migration_type column)
+    fn insert_version_row_old(conn: &Connection, version: u32, name: &str) {
+        conn.execute(
+            "INSERT INTO _migratio_version_ (version, name, applied_at, checksum) VALUES (?1, ?2, '2024-01-01T00:00:00+00:00', 'old_checksum')",
+            rusqlite::params![version, name],
+        ).unwrap();
+    }
+
+    // Helper: insert a row using the new schema (with migration_type)
+    fn insert_version_row(conn: &Connection, version: u32, name: &str, checksum: &str, migration_type: &str) {
+        conn.execute(
+            "INSERT INTO _migratio_version_ (version, name, applied_at, checksum, migration_type) VALUES (?1, ?2, '2024-01-01T00:00:00+00:00', ?3, ?4)",
+            rusqlite::params![version, name, checksum, migration_type],
+        ).unwrap();
+    }
+
+    // Helper: create the version table with the NEW schema
+    fn create_version_table(conn: &Connection) {
+        conn.execute(
+            "CREATE TABLE _migratio_version_ (version integer primary key not null, name text not null, applied_at text not null, checksum text not null, migration_type text not null default 'migration')",
+            [],
+        ).unwrap();
+    }
+
+    // Helper: create the version table with the OLD schema (no migration_type column)
+    fn create_version_table_old(conn: &Connection) {
+        conn.execute(
+            "CREATE TABLE _migratio_version_ (version integer primary key not null, name text not null, applied_at text not null, checksum text not null)",
+            [],
+        ).unwrap();
+    }
+
+    // --- Migrations used across multiple baseline tests ---
+
+    struct BaselineV5;
+    impl Migration for BaselineV5 {
+        fn version(&self) -> u32 { 5 }
+        fn name(&self) -> String { "baseline_v5".to_string() }
+        fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+            tx.execute("CREATE TABLE t5 (id INTEGER PRIMARY KEY)", [])?;
+            Ok(())
+        }
+        fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+            tx.execute("DROP TABLE t5", [])?;
+            Ok(())
+        }
+        #[cfg(feature = "mysql")]
+        fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+    }
+
+    struct BaselineV6;
+    impl Migration for BaselineV6 {
+        fn version(&self) -> u32 { 6 }
+        fn name(&self) -> String { "baseline_v6".to_string() }
+        fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+            tx.execute("CREATE TABLE t6 (id INTEGER PRIMARY KEY)", [])?;
+            Ok(())
+        }
+        fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+            tx.execute("DROP TABLE t6", [])?;
+            Ok(())
+        }
+        #[cfg(feature = "mysql")]
+        fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+    }
+
+    struct BaselineV7;
+    impl Migration for BaselineV7 {
+        fn version(&self) -> u32 { 7 }
+        fn name(&self) -> String { "baseline_v7".to_string() }
+        fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+            tx.execute("CREATE TABLE t7 (id INTEGER PRIMARY KEY)", [])?;
+            Ok(())
+        }
+        fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+            tx.execute("DROP TABLE t7", [])?;
+            Ok(())
+        }
+        #[cfg(feature = "mysql")]
+        fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+    }
+
+    // --- Test 1: baseline versions starting at 5 ---
+
+    #[test]
+    fn test_baseline_versions_starting_at_5() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![5, 6, 7]);
+        assert!(report.failing_migration.is_none());
+
+        // v5 should be recorded as BASELINE because it was applied to a fresh DB
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].version, 5);
+        assert_eq!(history[0].migration_type, MigrationType::Baseline);
+        assert_eq!(history[1].version, 6);
+        assert_eq!(history[1].migration_type, MigrationType::Migration);
+        assert_eq!(history[2].version, 7);
+        assert_eq!(history[2].migration_type, MigrationType::Migration);
+    }
+
+    // --- Test 2: versions with gap rejected ---
+
+    #[test]
+    fn test_versions_with_gap_rejected() {
+        struct M5;
+        impl Migration for M5 {
+            fn version(&self) -> u32 { 5 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M6;
+        impl Migration for M6 {
+            fn version(&self) -> u32 { 6 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M8;
+        impl Migration for M8 {
+            fn version(&self) -> u32 { 8 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        let result = SqliteMigrator::try_new(vec![Box::new(M5), Box::new(M6), Box::new(M8)]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("gap"), "expected gap error, got: {}", err);
+    }
+
+    // --- Test 3: single migration at version 10 is valid ---
+
+    #[test]
+    fn test_single_migration_at_version_10() {
+        struct M10;
+        impl Migration for M10 {
+            fn version(&self) -> u32 { 10 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        let result = SqliteMigrator::try_new(vec![Box::new(M10)]);
+        assert!(result.is_ok());
+        let migrator = result.unwrap();
+        assert_eq!(migrator.migrations()[0].version(), 10);
+    }
+
+    // --- Test 4: baseline fresh DB upgrade ---
+
+    #[test]
+    fn test_baseline_fresh_db_upgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![5, 6, 7]);
+        assert!(report.failing_migration.is_none());
+
+        // v5 is BASELINE (fresh DB), v6 and v7 are MIGRATION
+        let history = migrator.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history[0].migration_type, MigrationType::Baseline);
+        assert_eq!(history[1].migration_type, MigrationType::Migration);
+        assert_eq!(history[2].migration_type, MigrationType::Migration);
+
+        // Tables created by all 3 migrations exist
+        assert!(table_exists(&conn, "t5"));
+        assert!(table_exists(&conn, "t6"));
+        assert!(table_exists(&conn, "t7"));
+    }
+
+    // --- Test 5: baseline fresh DB creates correct schema ---
+
+    #[test]
+    fn test_baseline_fresh_db_creates_correct_schema() {
+        struct FullSchemaBaseline;
+        impl Migration for FullSchemaBaseline {
+            fn version(&self) -> u32 { 5 }
+            fn name(&self) -> String { "full_schema_baseline".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", [])?;
+                tx.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)", [])?;
+                tx.execute("CREATE TABLE products (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE users", [])?;
+                tx.execute("DROP TABLE orders", [])?;
+                tx.execute("DROP TABLE products", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        let migrator = SqliteMigrator::new(vec![Box::new(FullSchemaBaseline)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![5]);
+
+        assert!(table_exists(&conn, "users"));
+        assert!(table_exists(&conn, "orders"));
+        assert!(table_exists(&conn, "products"));
+    }
+
+    // --- Test 6: DB at baseline version skips baseline, runs later migrations ---
+
+    #[test]
+    fn test_baseline_db_at_baseline_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Simulate pre-compaction state: DB has v1-v5 recorded in old schema
+        create_version_table_old(&conn);
+        for v in 1..=5u32 {
+            insert_version_row_old(&conn, v, &format!("migration_{}", v));
+        }
+
+        // Migrator with [5,6,7]: v5 is baseline (creates full schema), v6 and v7 are new
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+        // v5 is skipped (already at version 5), v6 and v7 run
+        assert_eq!(report.migrations_run, vec![6, 7]);
+        assert!(report.failing_migration.is_none());
+
+        // Old rows v1-v4 still exist
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM _migratio_version_ WHERE version < 5").unwrap();
+        let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(count, 4);
+
+        // Tables t6 and t7 were created
+        assert!(table_exists(&conn, "t6"));
+        assert!(table_exists(&conn, "t7"));
+        // t5 was not re-created (v5 skipped)
+        assert!(!table_exists(&conn, "t5"));
+    }
+
+    // --- Test 7: checksum mismatch ignored for baseline version ---
+
+    #[test]
+    fn test_baseline_checksum_mismatch_ignored_for_baseline_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // DB has v5 with a mismatched name/checksum (old baseline)
+        create_version_table(&conn);
+        insert_version_row(&conn, 5, "old_baseline_name", "totally_wrong_checksum", "migration");
+
+        // Migrator has v5 as baseline but with a DIFFERENT name
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        // Should succeed: v5 is at or below baseline, so checksum is not validated
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![6, 7]);
+        assert!(report.failing_migration.is_none());
+    }
+
+    // --- Test 8: DB above baseline runs only new migrations ---
+
+    #[test]
+    fn test_baseline_db_above_baseline() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // DB has v1-v6 applied (with correct checksums for v6)
+        // First apply v1-v6 using a standard migrator to get proper checksums
+        struct M1; impl Migration for M1 {
+            fn version(&self) -> u32 { 1 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M2; impl Migration for M2 {
+            fn version(&self) -> u32 { 2 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M3; impl Migration for M3 {
+            fn version(&self) -> u32 { 3 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M4; impl Migration for M4 {
+            fn version(&self) -> u32 { 4 }
+            fn sqlite_up(&self, _tx: &Transaction) -> Result<(), Error> { Ok(()) }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        // Apply v1-v6 using inline structs. Use BaselineV5 and BaselineV6 for v5 and v6.
+        let setup_migrator = SqliteMigrator::new(vec![
+            Box::new(M1), Box::new(M2), Box::new(M3), Box::new(M4),
+            Box::new(BaselineV5), Box::new(BaselineV6),
+        ]);
+        setup_migrator.upgrade(&mut conn).unwrap();
+
+        // Now create migrator with [5,6,7] where 5 is baseline
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        let report = migrator.upgrade(&mut conn).unwrap();
+        // v5 and v6 already applied; only v7 runs
+        assert_eq!(report.migrations_run, vec![7]);
+        assert!(report.failing_migration.is_none());
+    }
+
+    // --- Test 9: DB fully migrated is a no-op ---
+
+    #[test]
+    fn test_baseline_db_fully_migrated() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        // Apply all migrations
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Run again — should be a no-op
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![] as Vec<u32>);
+        assert!(report.failing_migration.is_none());
+    }
+
+    // --- Test 10: DB below baseline errors ---
+
+    #[test]
+    fn test_baseline_db_below_baseline_errors() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // DB has v1-v3 applied
+        create_version_table(&conn);
+        for v in 1..=3u32 {
+            insert_version_row(&conn, v, &format!("migration_{}", v), "some_checksum", "migration");
+        }
+
+        // Migrator with baseline at v5 — DB is below baseline
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        let result = migrator.upgrade(&mut conn);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("below baseline"), "expected 'below baseline', got: {}", err_msg);
+    }
+
+    // --- Test 11: old rows not flagged as orphans ---
+
+    #[test]
+    fn test_baseline_old_rows_not_flagged_as_orphans() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // DB has rows v1-v5. Code has [5,6,7]. Versions 1-4 are pre-compaction leftovers.
+        create_version_table(&conn);
+        for v in 1..=5u32 {
+            insert_version_row(&conn, v, &format!("migration_{}", v), "old_checksum", "migration");
+        }
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        // Should NOT error due to v1-v4 being in DB but not in code
+        let result = migrator.upgrade(&mut conn);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let report = result.unwrap();
+        assert_eq!(report.migrations_run, vec![6, 7]);
+    }
+
+    // --- Test 12: checksum mismatch above baseline still errors ---
+
+    #[test]
+    fn test_baseline_checksum_mismatch_above_baseline_still_errors() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // DB has v5 (correct checksum) and v6 with WRONG checksum
+        create_version_table(&conn);
+        // v5 has correct checksum (will be skipped as baseline anyway)
+        insert_version_row(&conn, 5, "baseline_v5", "any_checksum", "baseline");
+        // v6 has wrong checksum (above baseline — must be validated)
+        insert_version_row(&conn, 6, "baseline_v6", "totally_wrong_checksum_for_v6", "migration");
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        let result = migrator.upgrade(&mut conn);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("checksum mismatch"), "expected checksum mismatch, got: {}", err_msg);
+        assert!(err_msg.contains("6"), "expected version 6 in error, got: {}", err_msg);
+    }
+
+    // --- Test 13: downgrade to baseline ---
+
+    #[test]
+    fn test_baseline_downgrade_to_baseline() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        // Apply all migrations
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Downgrade to v5 (baseline) — v6 and v7 rolled back, v5 remains
+        let report = migrator.downgrade(&mut conn, 5).unwrap();
+        assert_eq!(report.migrations_run, vec![7, 6]);
+        assert!(report.failing_migration.is_none());
+
+        let version = migrator.get_current_version(&mut conn).unwrap();
+        assert_eq!(version, 5);
+
+        // t6 and t7 dropped, t5 still exists
+        assert!(table_exists(&conn, "t5"));
+        assert!(!table_exists(&conn, "t6"));
+        assert!(!table_exists(&conn, "t7"));
+    }
+
+    // --- Test 14: downgrade below baseline errors ---
+
+    #[test]
+    fn test_baseline_downgrade_below_baseline_errors() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        migrator.upgrade(&mut conn).unwrap();
+
+        // Attempt to downgrade to v3 (below baseline v5)
+        let result = migrator.downgrade(&mut conn, 3);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Cannot downgrade below baseline"),
+            "expected 'Cannot downgrade below baseline', got: {}",
+            err_msg
+        );
+    }
+
+    // --- Test 15: downgrade to zero errors when baseline is set ---
+
+    #[test]
+    fn test_baseline_downgrade_to_zero_errors() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        migrator.upgrade(&mut conn).unwrap();
+
+        // downgrade(0) is below baseline v5
+        let result = migrator.downgrade(&mut conn, 0);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Cannot downgrade below baseline"),
+            "expected 'Cannot downgrade below baseline', got: {}",
+            err_msg
+        );
+    }
+
+    // --- Test 16: preview upgrade on fresh DB with baseline ---
+
+    #[test]
+    fn test_baseline_preview_upgrade_fresh_db() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        let pending = migrator.preview_upgrade(&mut conn).unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].version(), 5);
+        assert_eq!(pending[1].version(), 6);
+        assert_eq!(pending[2].version(), 7);
+    }
+
+    // --- Test 17: preview upgrade when at baseline ---
+
+    #[test]
+    fn test_baseline_preview_upgrade_at_baseline() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        // Apply only the baseline
+        migrator.upgrade_to(&mut conn, 5).unwrap();
+
+        let pending = migrator.preview_upgrade(&mut conn).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].version(), 6);
+        assert_eq!(pending[1].version(), 7);
+    }
+
+    // --- Test 18: preview downgrade ---
+
+    #[test]
+    fn test_baseline_preview_downgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        migrator.upgrade(&mut conn).unwrap();
+
+        let to_rollback = migrator.preview_downgrade(&mut conn, 5).unwrap();
+        assert_eq!(to_rollback.len(), 2);
+        assert_eq!(to_rollback[0].version(), 7); // reverse order
+        assert_eq!(to_rollback[1].version(), 6);
+    }
+
+    // --- Test 19: preview downgrade below baseline errors ---
+
+    #[test]
+    fn test_baseline_preview_downgrade_below_baseline_errors() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]);
+
+        migrator.upgrade(&mut conn).unwrap();
+
+        let result = migrator.preview_downgrade(&mut conn, 3);
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Cannot downgrade below baseline"),
+            "expected 'Cannot downgrade below baseline', got: {}",
+            err_msg
+        );
+    }
+
+    // --- Test 20: multi-rebaseline (THE KEY TEST) ---
+
+    #[test]
+    fn test_multi_rebaseline() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Define migrations for steps 1-3
+        struct M3; impl Migration for M3 {
+            fn version(&self) -> u32 { 3 }
+            fn name(&self) -> String { "m3".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE t3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t3", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M4; impl Migration for M4 {
+            fn version(&self) -> u32 { 4 }
+            fn name(&self) -> String { "m4".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE t4 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t4", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        // For step 2's baseline at v5: creates all prior schema
+        struct M5Baseline; impl Migration for M5Baseline {
+            fn version(&self) -> u32 { 5 }
+            fn name(&self) -> String { "m5_baseline".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                // Creates full schema (t3+t4+t5 all in one)
+                tx.execute("CREATE TABLE t3_b (id INTEGER PRIMARY KEY)", [])?;
+                tx.execute("CREATE TABLE t4_b (id INTEGER PRIMARY KEY)", [])?;
+                tx.execute("CREATE TABLE t5_b (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t3_b", [])?;
+                tx.execute("DROP TABLE t4_b", [])?;
+                tx.execute("DROP TABLE t5_b", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        // Step 1's v5 (original, no baseline)
+        struct M5Orig; impl Migration for M5Orig {
+            fn version(&self) -> u32 { 5 }
+            fn name(&self) -> String { "m5_orig".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE t5_orig (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t5_orig", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M6; impl Migration for M6 {
+            fn version(&self) -> u32 { 6 }
+            fn name(&self) -> String { "m6".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE t6_r (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t6_r", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M7; impl Migration for M7 {
+            fn version(&self) -> u32 { 7 }
+            fn name(&self) -> String { "m7".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE t7_r (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t7_r", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        // For step 3's baseline at v7
+        struct M7Baseline; impl Migration for M7Baseline {
+            fn version(&self) -> u32 { 7 }
+            fn name(&self) -> String { "m7_baseline".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE full_schema_7 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE full_schema_7", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M8; impl Migration for M8 {
+            fn version(&self) -> u32 { 8 }
+            fn name(&self) -> String { "m8".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE t8_r (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t8_r", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M9; impl Migration for M9 {
+            fn version(&self) -> u32 { 9 }
+            fn name(&self) -> String { "m9".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE t9_r (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE t9_r", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        // Step 1: Migrator with [3,4,5]. Upgrade fresh DB.
+        let migrator1 = SqliteMigrator::new(vec![
+            Box::new(M3), Box::new(M4), Box::new(M5Orig),
+        ]);
+        let report1 = migrator1.upgrade(&mut conn).unwrap();
+        assert_eq!(report1.migrations_run, vec![3, 4, 5]);
+
+        // Check that v3 is BASELINE (applied to fresh DB with baseline=3)
+        let history1 = migrator1.get_migration_history(&mut conn).unwrap();
+        assert_eq!(history1[0].version, 3);
+        assert_eq!(history1[0].migration_type, MigrationType::Baseline);
+        assert_eq!(history1[1].migration_type, MigrationType::Migration);
+        assert_eq!(history1[2].migration_type, MigrationType::Migration);
+
+        // Step 2: NEW migrator with [5,6,7] (compacted 3-5 into baseline at 5).
+        let migrator2 = SqliteMigrator::new(vec![
+            Box::new(M5Baseline), Box::new(M6), Box::new(M7),
+        ]);
+        let report2 = migrator2.upgrade(&mut conn).unwrap();
+        // v3,v4 old rows ignored; v5 skipped (already applied); v6, v7 run
+        assert_eq!(report2.migrations_run, vec![6, 7]);
+        assert!(report2.failing_migration.is_none());
+
+        // Step 3: ANOTHER new migrator with [7,8,9] (compacted 5-7 into baseline at 7).
+        let migrator3 = SqliteMigrator::new(vec![
+            Box::new(M7Baseline), Box::new(M8), Box::new(M9),
+        ]);
+        let report3 = migrator3.upgrade(&mut conn).unwrap();
+        // v3-v6 old rows ignored; v7 skipped; v8, v9 run
+        assert_eq!(report3.migrations_run, vec![8, 9]);
+        assert!(report3.failing_migration.is_none());
+
+        // Final state: current version is 9
+        let final_version = migrator3.get_current_version(&mut conn).unwrap();
+        assert_eq!(final_version, 9);
+
+        // DB has rows v3-v9 (7 rows total)
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _migratio_version_", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 7);
+    }
+
+    // --- Test 21: migration_type column added to existing table ---
+
+    #[test]
+    fn test_migration_type_column_added_to_existing_table() {
+        // This test simulates a DB that has the old schema: version, name, applied_at, checksum
+        // but no migration_type column. After upgrade, migration_type should be added
+        // and existing rows should default to 'migration'.
+
+        struct M1; impl Migration for M1 {
+            fn version(&self) -> u32 { 1 }
+            fn name(&self) -> String { "original_migration".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE legacy_stuff (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M2; impl Migration for M2 {
+            fn version(&self) -> u32 { 2 }
+            fn name(&self) -> String { "new_migration".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE new_stuff (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Create old-schema table (no migration_type column) and insert v1 with correct checksum
+        create_version_table_old(&conn);
+        let m1_checksum = {
+            let m: Box<dyn Migration> = Box::new(M1);
+            GenericMigrator::calculate_checksum(&m)
+        };
+        conn.execute(
+            "INSERT INTO _migratio_version_ (version, name, applied_at, checksum) VALUES (1, 'original_migration', '2024-01-01T00:00:00+00:00', ?1)",
+            rusqlite::params![m1_checksum],
+        ).unwrap();
+
+        // Verify migration_type column does NOT exist yet
+        let has_migration_type_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('_migratio_version_') WHERE name='migration_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_migration_type_before, 0);
+
+        let migrator = SqliteMigrator::new(vec![Box::new(M1), Box::new(M2)]);
+        let report = migrator.upgrade(&mut conn).unwrap();
+        // v1 already applied, only v2 runs
+        assert_eq!(report.migrations_run, vec![2]);
+
+        // migration_type column now exists
+        let has_migration_type: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('_migratio_version_') WHERE name='migration_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_migration_type, 1);
+
+        // Old row defaults to 'migration'
+        let migration_type: String = conn
+            .query_row(
+                "SELECT migration_type FROM _migratio_version_ WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_type, "migration");
+    }
+
+    // --- Test 22: no baseline backward compatible ---
+
+    #[test]
+    fn test_no_baseline_backward_compatible() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        struct M1; impl Migration for M1 {
+            fn version(&self) -> u32 { 1 }
+            fn name(&self) -> String { "m1".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE bc_t1 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE bc_t1", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M2; impl Migration for M2 {
+            fn version(&self) -> u32 { 2 }
+            fn name(&self) -> String { "m2".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE bc_t2 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE bc_t2", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+        struct M3; impl Migration for M3 {
+            fn version(&self) -> u32 { 3 }
+            fn name(&self) -> String { "m3".to_string() }
+            fn sqlite_up(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("CREATE TABLE bc_t3 (id INTEGER PRIMARY KEY)", [])?;
+                Ok(())
+            }
+            fn sqlite_down(&self, tx: &Transaction) -> Result<(), Error> {
+                tx.execute("DROP TABLE bc_t3", [])?;
+                Ok(())
+            }
+            #[cfg(feature = "mysql")]
+            fn mysql_up(&self, _conn: &mut mysql::Conn) -> Result<(), Error> { Ok(()) }
+        }
+
+        let migrator = SqliteMigrator::new(vec![Box::new(M1), Box::new(M2), Box::new(M3)]);
+
+        // Upgrade works
+        let report = migrator.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![1, 2, 3]);
+
+        // Downgrade to 0 works (no baseline restriction)
+        let report = migrator.downgrade(&mut conn, 0).unwrap();
+        assert_eq!(report.migrations_run, vec![3, 2, 1]);
+
+        // All migrations were recorded as Migration type
+        let migrator2 = SqliteMigrator::new(vec![Box::new(M1), Box::new(M2), Box::new(M3)]);
+        migrator2.upgrade(&mut conn).unwrap();
+        let history = migrator2.get_migration_history(&mut conn).unwrap();
+        for entry in &history {
+            assert_eq!(entry.migration_type, MigrationType::Migration);
+        }
+
+        // Checksums validated correctly
+        let report = migrator2.upgrade(&mut conn).unwrap();
+        assert_eq!(report.migrations_run, vec![] as Vec<u32>);
+    }
+
+    // --- Test 23: callbacks fire for baseline migration ---
+
+    #[test]
+    fn test_baseline_callbacks_fire() {
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        let started = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let completed = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let started_clone = Arc::clone(&started);
+        let completed_clone = Arc::clone(&completed);
+
+        let migrator = SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ])
+        .on_migration_start(move |version, _name| {
+            started_clone.lock().unwrap().push(version);
+        })
+        .on_migration_complete(move |version, _name, _duration| {
+            completed_clone.lock().unwrap().push(version);
+        });
+
+        migrator.upgrade(&mut conn).unwrap();
+
+        let started_vec = started.lock().unwrap();
+        let completed_vec = completed.lock().unwrap();
+
+        assert_eq!(*started_vec, vec![5, 6, 7]);
+        assert_eq!(*completed_vec, vec![5, 6, 7]);
+    }
+
+    // --- Test 24: test harness with baseline migrate_to ---
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_harness_baseline_migrate_to() {
+        use crate::testing::sqlite::SqliteTestHarness;
+
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]));
+
+        // migrate_to(5) works (baseline)
+        harness.migrate_to(5).unwrap();
+        assert_eq!(harness.current_version().unwrap(), 5);
+
+        // migrate_to(7) works
+        harness.migrate_to(7).unwrap();
+        assert_eq!(harness.current_version().unwrap(), 7);
+
+        // migrate_to(3) errors — version 3 is not in migration list
+        let result = harness.migrate_to(3);
+        assert!(result.is_err(), "expected error for version 3 below baseline");
+    }
+
+    // --- Test 25: test harness migrate_up_one from version 0 goes to v5 ---
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_harness_baseline_migrate_up_one() {
+        use crate::testing::sqlite::SqliteTestHarness;
+
+        let mut harness = SqliteTestHarness::new(SqliteMigrator::new(vec![
+            Box::new(BaselineV5),
+            Box::new(BaselineV6),
+            Box::new(BaselineV7),
+        ]));
+
+        // From version 0, migrate_up_one should go to v5 (first migration in list)
+        harness.migrate_up_one().unwrap();
+        assert_eq!(harness.current_version().unwrap(), 5);
+
+        // Next migrate_up_one goes to v6
+        harness.migrate_up_one().unwrap();
+        assert_eq!(harness.current_version().unwrap(), 6);
+    }
 }
