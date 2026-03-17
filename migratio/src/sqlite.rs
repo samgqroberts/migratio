@@ -4656,10 +4656,10 @@ mod tests {
 
         // Verify hooks were called correctly
         let events_vec = events.lock().unwrap();
-        assert_eq!(events_vec.len(), 3);
+        assert_eq!(events_vec.len(), 2);
         assert_eq!(events_vec[0], "start:1:Migration 1");
         assert_eq!(events_vec[1], "skipped:1:Migration 1");
-        assert_eq!(events_vec[2], "complete:1:Migration 1");
+        // on_migration_complete should NOT fire for skipped migrations
     }
 
     #[test]
