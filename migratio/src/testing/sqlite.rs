@@ -177,16 +177,25 @@ impl SqliteTestHarness {
 
     /// Migrate up by exactly one migration.
     ///
-    /// Note: This will run all pending migrations and verify exactly one was run.
     /// If you have multiple pending migrations and only want to run one, use `migrate_to()` instead.
     pub fn migrate_up_one(&mut self) -> Result<(), Error> {
         let current = self.current_version()?;
-        let target = current + 1;
 
-        // Use migrate_to to only go up one version
-        self.migrate_to(target)?;
+        // Find the next migration version after current, since versions may not be contiguous
+        let next_version = self
+            .migrator
+            .migrations()
+            .iter()
+            .map(|m| m.version())
+            .filter(|&v| v > current)
+            .min();
 
-        Ok(())
+        match next_version {
+            Some(target) => self.migrate_to(target),
+            None => Err(Error::Rusqlite(rusqlite::Error::InvalidParameterName(
+                "No more migrations to apply".to_string(),
+            ))),
+        }
     }
 
     /// Migrate down by exactly one migration.
