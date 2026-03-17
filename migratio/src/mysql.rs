@@ -791,8 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Migration versions must start at 1")]
-    async fn new_rejects_non_starting_at_one() {
+    async fn new_accepts_non_starting_at_one() {
         struct Migration2;
         impl Migration for Migration2 {
             fn version(&self) -> u32 {
@@ -821,7 +820,11 @@ mod tests {
             }
         }
 
-        MysqlMigrator::new(vec![Box::new(Migration2), Box::new(Migration3)]);
+        // [2, 3] is now valid — version 2 is treated as a baseline
+        let migrator = MysqlMigrator::new(vec![Box::new(Migration2), Box::new(Migration3)]);
+        assert_eq!(migrator.migrations().len(), 2);
+        assert_eq!(migrator.migrations()[0].version(), 2);
+        assert_eq!(migrator.migrations()[1].version(), 3);
     }
 
     #[tokio::test]
@@ -859,7 +862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_new_returns_err_for_non_starting_at_one() {
+    async fn try_new_returns_ok_for_non_starting_at_one() {
         struct Migration2;
         impl Migration for Migration2 {
             fn version(&self) -> u32 {
@@ -874,11 +877,12 @@ mod tests {
             }
         }
 
+        // version 2 as the sole migration is now valid — it becomes the baseline
         let result = MysqlMigrator::try_new(vec![Box::new(Migration2)]);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Migration versions must start at 1"));
+        assert!(result.is_ok());
+        let migrator = result.unwrap();
+        assert_eq!(migrator.migrations().len(), 1);
+        assert_eq!(migrator.migrations()[0].version(), 2);
     }
 
     #[tokio::test]
