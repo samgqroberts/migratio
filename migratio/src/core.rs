@@ -662,14 +662,14 @@ impl GenericMigrator {
                         let current_checksum = Self::calculate_checksum(migration);
                         if current_checksum != row.checksum {
                             return Err(Error::Generic(format!(
-                                "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                                Migration name in DB: '{}', current name: '{}'. \
+                                "Migration {} checksum mismatch. Expected '{}' but found '{}' in database. \
+                                Current name: '{}', name in DB: '{}'. \
                                 This indicates the migration was modified after being applied.",
                                 row.version,
-                                row.checksum,
                                 current_checksum,
-                                row.name,
-                                migration.name()
+                                row.checksum,
+                                migration.name(),
+                                row.name
                             )));
                         }
                     } else {
@@ -802,12 +802,23 @@ impl GenericMigrator {
                     Ok(was_applied) => {
                         let migration_duration = migration_start.elapsed();
 
+                        // Record migration as run regardless of whether it was applied or skipped
+                        migrations_run.push(migration_version);
+                        // Since any migration succeeded, if schema version table had not originally existed,
+                        // we can mark that it was created
+                        schema_version_table_created = true;
+
                         if was_applied {
                             #[cfg(feature = "tracing")]
                             tracing::info!(
                                 duration_ms = migration_duration.as_millis(),
                                 "Migration completed successfully"
                             );
+
+                            // Call on_migration_complete hook
+                            if let Some(ref callback) = self.on_migration_complete {
+                                callback(migration_version, &migration.name(), migration_duration);
+                            }
                         } else {
                             // Precondition was AlreadySatisfied
                             #[cfg(feature = "tracing")]
@@ -817,17 +828,6 @@ impl GenericMigrator {
                             if let Some(ref callback) = self.on_migration_skipped {
                                 callback(migration_version, &migration.name());
                             }
-                        }
-
-                        // Record migration as run regardless of whether it was applied or skipped
-                        migrations_run.push(migration_version);
-                        // Since any migration succeeded, if schema version table had not originally existed,
-                        // we can mark that it was created
-                        schema_version_table_created = true;
-
-                        // Call on_migration_complete hook
-                        if let Some(ref callback) = self.on_migration_complete {
-                            callback(migration_version, &migration.name(), migration_duration);
                         }
                     }
                     Err(e) => {
@@ -910,14 +910,14 @@ impl GenericMigrator {
                     let current_checksum = Self::calculate_checksum(migration);
                     if current_checksum != row.checksum {
                         return Err(Error::Generic(format!(
-                            "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                            Migration name in DB: '{}', current name: '{}'. \
+                            "Migration {} checksum mismatch. Expected '{}' but found '{}' in database. \
+                            Current name: '{}', name in DB: '{}'. \
                             This indicates the migration was modified after being applied.",
                             row.version,
-                            row.checksum,
                             current_checksum,
-                            row.name,
-                            migration.name()
+                            row.checksum,
+                            migration.name(),
+                            row.name
                         )));
                     }
                 } else {
