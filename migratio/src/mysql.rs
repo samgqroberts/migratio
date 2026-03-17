@@ -76,22 +76,216 @@
 //! run it again on the next `upgrade()` call.
 //!
 
-use crate::core::GenericMigrator;
+use crate::core::{AppliedMigrationRow, GenericMigrator, MigrationBackend};
 use crate::error::Error;
 use crate::AppliedMigration;
 use crate::Migration;
-use crate::MigrationFailure;
 use crate::MigrationType;
 use crate::MigrationReport;
 use crate::Precondition;
 use chrono::Utc;
 use mysql::prelude::Queryable;
 use mysql::Conn;
-use std::time::Instant;
 
 // Re-export mysql types for use in migrations
 pub use mysql::prelude::Queryable as MysqlQueryable;
 pub use mysql::Conn as MysqlConn;
+
+/// MySQL-specific backend implementing the MigrationBackend trait.
+pub(crate) struct MysqlBackend;
+
+impl MigrationBackend for MysqlBackend {
+    type Conn = Conn;
+
+    fn version_table_exists(conn: &mut Conn, table_name: &str) -> Result<bool, Error> {
+        let exists: bool = conn
+            .query_first(format!(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{}'",
+                table_name
+            ))?
+            .map(|(count,): (i64,)| count > 0)
+            .unwrap_or(false);
+        Ok(exists)
+    }
+
+    fn create_version_table(conn: &mut Conn, table_name: &str) -> Result<(), Error> {
+        conn.query_drop(format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                version INT UNSIGNED PRIMARY KEY NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                applied_at VARCHAR(255) NOT NULL,
+                checksum VARCHAR(64) NOT NULL,
+                migration_type VARCHAR(20) NOT NULL DEFAULT 'migration'
+            )",
+            table_name
+        ))?;
+        Ok(())
+    }
+
+    fn column_exists(
+        conn: &mut Conn,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<bool, Error> {
+        let exists: bool = conn
+            .query_first(format!(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = DATABASE()
+                 AND table_name = '{}'
+                 AND column_name = '{}'",
+                table_name, column_name
+            ))?
+            .map(|(count,): (i64,)| count > 0)
+            .unwrap_or(false);
+        Ok(exists)
+    }
+
+    fn add_column(
+        conn: &mut Conn,
+        table_name: &str,
+        column_name: &str,
+        column_def: &str,
+    ) -> Result<(), Error> {
+        conn.query_drop(format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            table_name, column_name, column_def
+        ))?;
+        Ok(())
+    }
+
+    fn get_applied_migration_rows(
+        conn: &mut Conn,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigrationRow>, Error> {
+        let rows: Vec<(u32, String, String)> = conn.query(format!(
+            "SELECT version, name, checksum FROM {}",
+            table_name
+        ))?;
+        Ok(rows
+            .into_iter()
+            .map(|(version, name, checksum)| AppliedMigrationRow {
+                version,
+                name,
+                checksum,
+            })
+            .collect())
+    }
+
+    fn get_max_version(conn: &mut Conn, table_name: &str) -> Result<u32, Error> {
+        let result: Option<(Option<u32>,)> =
+            conn.query_first(format!("SELECT MAX(version) FROM {}", table_name))?;
+        Ok(result.and_then(|(v,)| v).unwrap_or(0))
+    }
+
+    fn get_migration_history_rows(
+        conn: &mut Conn,
+        table_name: &str,
+    ) -> Result<Vec<AppliedMigration>, Error> {
+        // Check whether the migration_type column exists for backwards compatibility
+        let has_migration_type = Self::column_exists(conn, table_name, "migration_type")?;
+
+        let rows: Vec<AppliedMigration> = if has_migration_type {
+            let raw: Vec<(u32, String, String, String, String)> = conn.query(format!(
+                "SELECT version, name, applied_at, checksum, migration_type FROM {} ORDER BY version",
+                table_name
+            ))?;
+            raw.into_iter()
+                .map(|(version, name, applied_at_str, checksum, migration_type_str)| {
+                    let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
+                        .map_err(|e| Error::Generic(format!("Failed to parse datetime: {}", e)))?
+                        .with_timezone(&Utc);
+                    let migration_type = if migration_type_str == "baseline" {
+                        MigrationType::Baseline
+                    } else {
+                        MigrationType::Migration
+                    };
+                    Ok(AppliedMigration {
+                        version,
+                        name,
+                        applied_at,
+                        checksum,
+                        migration_type,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
+            let raw: Vec<(u32, String, String, String)> = conn.query(format!(
+                "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
+                table_name
+            ))?;
+            raw.into_iter()
+                .map(|(version, name, applied_at_str, checksum)| {
+                    let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
+                        .map_err(|e| Error::Generic(format!("Failed to parse datetime: {}", e)))?
+                        .with_timezone(&Utc);
+                    Ok(AppliedMigration {
+                        version,
+                        name,
+                        applied_at,
+                        checksum,
+                        migration_type: MigrationType::Migration,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        };
+
+        Ok(rows)
+    }
+
+    fn execute_migration_up(
+        conn: &mut Conn,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+        applied_at: &str,
+        checksum: &str,
+        migration_type: MigrationType,
+    ) -> Result<bool, Error> {
+        // Check precondition
+        let precondition = migration.mysql_precondition(conn)?;
+
+        match precondition {
+            Precondition::AlreadySatisfied => {
+                // Stamp without running up() — no transaction needed for MySQL
+                conn.exec_drop(
+                    format!(
+                        "INSERT INTO {} (version, name, applied_at, checksum, migration_type) VALUES(?, ?, ?, ?, ?)",
+                        table_name
+                    ),
+                    (migration.version(), migration.name(), applied_at, checksum, migration_type.to_string()),
+                )?;
+                Ok(false)
+            }
+            Precondition::NeedsApply => {
+                // Run the migration directly — no transaction (MySQL DDL causes implicit commits)
+                migration.mysql_up(conn)?;
+                // Insert version row after migration succeeds
+                conn.exec_drop(
+                    format!(
+                        "INSERT INTO {} (version, name, applied_at, checksum, migration_type) VALUES(?, ?, ?, ?, ?)",
+                        table_name
+                    ),
+                    (migration.version(), migration.name(), applied_at, checksum, migration_type.to_string()),
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn execute_migration_down(
+        conn: &mut Conn,
+        migration: &Box<dyn Migration>,
+        table_name: &str,
+    ) -> Result<(), Error> {
+        // Run the rollback directly — no transaction (MySQL DDL causes implicit commits)
+        migration.mysql_down(conn)?;
+        // Delete version row after rollback succeeds
+        conn.exec_drop(
+            format!("DELETE FROM {} WHERE version = ?", table_name),
+            (migration.version(),),
+        )?;
+        Ok(())
+    }
+}
 
 /// The entrypoint for running a sequence of [Migration]s on a MySQL database.
 /// Construct this struct with the list of all [Migration]s to be applied.
@@ -179,84 +373,20 @@ impl MysqlMigrator {
     /// Get the current migration version from the database.
     /// Returns 0 if no migrations have been applied.
     pub fn get_current_version(&self, conn: &mut Conn) -> Result<u32, Error> {
-        // Check if schema version table exists
-        let table_exists: bool = conn
-            .query_first(format!(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{}'",
-                self.schema_version_table_name()
-            ))?
-            .map(|(count,): (i64,)| count > 0)
-            .unwrap_or(false);
-
-        if !table_exists {
-            return Ok(0);
-        }
-
-        // Get current version (highest version number)
-        // Note: MAX() returns NULL when table is empty, so we need to handle that
-        let result: Option<(Option<u32>,)> = conn.query_first(format!(
-            "SELECT MAX(version) FROM {}",
-            self.schema_version_table_name()
-        ))?;
-        Ok(result.and_then(|(v,)| v).unwrap_or(0))
+        self.migrator.generic_get_current_version::<MysqlBackend>(conn)
     }
 
     /// Get the history of all migrations that have been applied to the database.
     /// Returns migrations in the order they were applied (by version number).
     /// Returns an empty vector if no migrations have been applied.
     pub fn get_migration_history(&self, conn: &mut Conn) -> Result<Vec<AppliedMigration>, Error> {
-        // Check if schema version table exists
-        let table_exists: bool = conn
-            .query_first(format!(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{}'",
-                self.schema_version_table_name()
-            ))?
-            .map(|(count,): (i64,)| count > 0)
-            .unwrap_or(false);
-
-        if !table_exists {
-            return Ok(vec![]);
-        }
-
-        // Query all applied migrations, ordered by version
-        let rows: Vec<(u32, String, String, String)> = conn.query(format!(
-            "SELECT version, name, applied_at, checksum FROM {} ORDER BY version",
-            self.schema_version_table_name()
-        ))?;
-
-        let migrations: Result<Vec<AppliedMigration>, Error> = rows
-            .into_iter()
-            .map(|(version, name, applied_at_str, checksum)| {
-                let applied_at = chrono::DateTime::parse_from_rfc3339(&applied_at_str)
-                    .map_err(|e| Error::Generic(format!("Failed to parse datetime: {}", e)))?
-                    .with_timezone(&Utc);
-
-                Ok(AppliedMigration {
-                    version,
-                    name,
-                    applied_at,
-                    checksum,
-                    migration_type: MigrationType::Migration,
-                })
-            })
-            .collect();
-
-        migrations
+        self.migrator.generic_get_migration_history::<MysqlBackend>(conn)
     }
 
     /// Preview which migrations would be applied by `upgrade()` without actually running them.
     /// Returns a list of migrations that would be executed, in the order they would run.
     pub fn preview_upgrade(&self, conn: &mut Conn) -> Result<Vec<&Box<dyn Migration>>, Error> {
-        let current_version = self.get_current_version(conn)?;
-
-        let mut pending_migrations = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > current_version)
-            .collect::<Vec<_>>();
-        pending_migrations.sort_by_key(|m| m.version());
-
-        Ok(pending_migrations)
+        self.migrator.generic_preview_upgrade::<MysqlBackend>(conn)
     }
 
     /// Preview which migrations would be rolled back by `downgrade(target_version)` without actually running them.
@@ -266,24 +396,8 @@ impl MysqlMigrator {
         conn: &mut Conn,
         target_version: u32,
     ) -> Result<Vec<&Box<dyn Migration>>, Error> {
-        let current_version = self.get_current_version(conn)?;
-
-        // Validate target version
-        if target_version > current_version {
-            return Err(Error::Generic(format!(
-                "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
-                target_version, current_version
-            )));
-        }
-
-        let mut migrations_to_rollback = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > target_version && m.version() <= current_version)
-            .collect::<Vec<_>>();
-        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.version())); // Reverse order
-
-        Ok(migrations_to_rollback)
+        self.migrator
+            .generic_preview_downgrade::<MysqlBackend>(conn, target_version)
     }
 
     /// Upgrade the database to a specific target version.
@@ -308,514 +422,26 @@ impl MysqlMigrator {
             )));
         }
 
-        self.upgrade_internal(conn, Some(target_version))
+        self.migrator
+            .generic_upgrade::<MysqlBackend>(conn, Some(target_version))
     }
 
     /// Upgrade the database by running all pending migrations.
     pub fn upgrade(&self, conn: &mut Conn) -> Result<MigrationReport<'_>, Error> {
-        self.upgrade_internal(conn, None)
-    }
-
-    fn upgrade_internal(
-        &self,
-        conn: &mut Conn,
-        target_version: Option<u32>,
-    ) -> Result<MigrationReport<'_>, Error> {
-        // Check if schema version tracking table exists
-        let schema_version_table_existed: bool = conn
-            .query_first(format!(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{}'",
-                self.schema_version_table_name()
-            ))?
-            .map(|(count,): (i64,)| count > 0)
-            .unwrap_or(false);
-
-        if !schema_version_table_existed {
-            // Create table with name and checksum columns
-            conn.query_drop(format!(
-                "CREATE TABLE IF NOT EXISTS {} (
-                    version INT UNSIGNED PRIMARY KEY NOT NULL,
-                    name VARCHAR(255) NOT NULL,
-                    applied_at VARCHAR(255) NOT NULL,
-                    checksum VARCHAR(64) NOT NULL
-                )",
-                self.schema_version_table_name()
-            ))?;
-        }
-
-        // Validate checksums of previously-applied migrations
-        if schema_version_table_existed {
-            // Check if the checksum column exists (for backwards compatibility)
-            let has_checksum_column: bool = conn
-                .query_first(format!(
-                    "SELECT COUNT(*) FROM information_schema.columns
-                     WHERE table_schema = DATABASE()
-                     AND table_name = '{}'
-                     AND column_name = 'checksum'",
-                    self.schema_version_table_name()
-                ))?
-                .map(|(count,): (i64,)| count > 0)
-                .unwrap_or(false);
-
-            if has_checksum_column {
-                // Get all applied migrations with their checksums
-                let applied_migrations: Vec<(u32, String, String)> = conn.query(format!(
-                    "SELECT version, name, checksum FROM {}",
-                    self.schema_version_table_name()
-                ))?;
-
-                // Verify checksums match for migrations that were already applied
-                // Also detect missing migrations (in DB but not in code)
-                for (applied_version, applied_name, applied_checksum) in &applied_migrations {
-                    if let Some(migration) = self
-                        .migrations()
-                        .iter()
-                        .find(|m| m.version() == *applied_version)
-                    {
-                        let current_checksum = GenericMigrator::calculate_checksum(migration);
-                        if current_checksum != *applied_checksum {
-                            return Err(Error::Generic(format!(
-                                "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                                Migration name in DB: '{}', current name: '{}'. \
-                                This indicates the migration was modified after being applied.",
-                                applied_version,
-                                applied_checksum,
-                                current_checksum,
-                                applied_name,
-                                migration.name()
-                            )));
-                        }
-                    } else {
-                        // Migration exists in database but not in code - this is a missing migration
-                        return Err(Error::Generic(format!(
-                            "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
-                            Applied migrations cannot be removed from the codebase.",
-                            applied_version,
-                            applied_name
-                        )));
-                    }
-                }
-
-                // Detect orphaned migrations (in code but applied migrations are not contiguous)
-                let applied_versions: Vec<u32> =
-                    applied_migrations.iter().map(|(v, _, _)| *v).collect();
-                if !applied_versions.is_empty() {
-                    let max_applied = *applied_versions.iter().max().unwrap();
-
-                    // Check if all migrations up to max_applied exist in the database
-                    for expected_version in 1..=max_applied {
-                        if !applied_versions.contains(&expected_version) {
-                            // There's a gap - check if this migration exists in our code
-                            if let Some(missing_migration) = self
-                                .migrations()
-                                .iter()
-                                .find(|m| m.version() == expected_version)
-                            {
-                                return Err(Error::Generic(format!(
-                                    "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
-                                    This likely means migration {} was added after migration {} was already applied. \
-                                    Applied migrations: {:?}",
-                                    expected_version,
-                                    missing_migration.name(),
-                                    expected_version,
-                                    max_applied,
-                                    applied_versions
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // get current migration version (highest version number)
-        let result: Option<(Option<u32>,)> = conn.query_first(format!(
-            "SELECT MAX(version) FROM {}",
-            self.schema_version_table_name()
-        ))?;
-        let current_version: u32 = result.and_then(|(v,)| v).unwrap_or(0);
-
-        // iterate through migrations, run those that haven't been run
-        let mut migrations_run: Vec<u32> = Vec::new();
-        let mut migrations_sorted = self
-            .migrations()
-            .iter()
-            .map(|x| (x.version(), x))
-            .collect::<Vec<_>>();
-        migrations_sorted.sort_by_key(|m| m.0);
-        let mut failing_migration: Option<MigrationFailure> = None;
-        let mut schema_version_table_created = false;
-        // Track the applied_at time for this upgrade() call - all migrations in this batch get the same timestamp
-        let batch_applied_at = Utc::now().to_rfc3339();
-
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            current_version = current_version,
-            target_version = ?target_version,
-            available_migrations = ?migrations_sorted.iter().map(|(v, m)| (*v, m.name())).collect::<Vec<_>>(),
-            "Considering migrations to run"
-        );
-
-        for (migration_version, migration) in migrations_sorted {
-            // Stop if we've reached the target version (if specified)
-            if let Some(target) = target_version {
-                if migration_version > target {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        migration_version = migration_version,
-                        target_version = target,
-                        "Skipping migration (beyond target version)"
-                    );
-                    break;
-                }
-            }
-
-            if current_version < migration_version {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    migration_version = migration_version,
-                    migration_name = %migration.name(),
-                    "Migration needs to be applied"
-                );
-                #[cfg(feature = "tracing")]
-                let _span = tracing::info_span!(
-                    "mysql_migration_up",
-                    version = migration_version,
-                    name = %migration.name()
-                )
-                .entered();
-
-                #[cfg(feature = "tracing")]
-                tracing::info!("Starting migration");
-
-                // Call on_migration_start hook
-                if let Some(ref callback) = self.migrator.on_migration_start {
-                    callback(migration_version, &migration.name());
-                }
-
-                let migration_start = Instant::now();
-
-                // Check precondition
-                let precondition = match migration.mysql_precondition(conn) {
-                    Ok(p) => p,
-                    Err(error) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            error = %error,
-                            "Precondition check failed"
-                        );
-
-                        // Call on_migration_error hook
-                        if let Some(ref callback) = self.migrator.on_migration_error {
-                            callback(migration_version, &migration.name(), &error);
-                        }
-
-                        failing_migration = Some(MigrationFailure { migration, error });
-                        break;
-                    }
-                };
-
-                // Run migration or stamp if precondition is satisfied
-                let migration_result = match precondition {
-                    Precondition::AlreadySatisfied => {
-                        #[cfg(feature = "tracing")]
-                        tracing::info!("Precondition already satisfied, stamping migration without running up()");
-
-                        // Call on_migration_skipped hook
-                        if let Some(ref callback) = self.migrator.on_migration_skipped {
-                            callback(migration_version, &migration.name());
-                        }
-
-                        Ok(())
-                    }
-                    Precondition::NeedsApply => {
-                        // Run the migration directly on the connection
-                        // Note: In MySQL, DDL statements cause implicit commits and cannot be rolled back
-                        migration.mysql_up(conn)
-                    }
-                };
-
-                match migration_result {
-                    Ok(_) => {
-                        let migration_duration = migration_start.elapsed();
-
-                        #[cfg(feature = "tracing")]
-                        tracing::info!(
-                            duration_ms = migration_duration.as_millis(),
-                            "Migration completed successfully"
-                        );
-
-                        // Calculate checksum for this migration
-                        let checksum = GenericMigrator::calculate_checksum(migration);
-
-                        // Insert a row for this migration with its name, timestamp, and checksum
-                        conn.exec_drop(
-                            format!(
-                                "INSERT INTO {} (version, name, applied_at, checksum) VALUES(?, ?, ?, ?)",
-                                self.schema_version_table_name()
-                            ),
-                            (migration_version, migration.name(), &batch_applied_at, checksum),
-                        )?;
-
-                        // record migration as run
-                        migrations_run.push(migration_version);
-                        // also, since any migration succeeded, if schema version table had not originally existed,
-                        // we can mark that it was created
-                        schema_version_table_created = true;
-
-                        // Call on_migration_complete hook
-                        if let Some(ref callback) = self.migrator.on_migration_complete {
-                            callback(migration_version, &migration.name(), migration_duration);
-                        }
-                    }
-                    Err(e) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(
-                            error = %e,
-                            "Migration failed"
-                        );
-
-                        // Call on_migration_error hook
-                        if let Some(ref callback) = self.migrator.on_migration_error {
-                            callback(migration_version, &migration.name(), &e);
-                        }
-
-                        // Transaction will be automatically rolled back when dropped
-                        failing_migration = Some(MigrationFailure {
-                            migration,
-                            error: e,
-                        });
-                        break;
-                    }
-                }
-            } else {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    migration_version = migration_version,
-                    current_version = current_version,
-                    "Skipping migration (already applied)"
-                );
-            }
-        }
-        // return report
-        Ok(MigrationReport {
-            schema_version_table_existed,
-            schema_version_table_created,
-            failing_migration,
-            migrations_run,
-        })
+        self.migrator.generic_upgrade::<MysqlBackend>(conn, None)
     }
 
     /// Rollback migrations down to the specified target version.
     /// Pass `target_version = 0` to rollback all migrations.
-    /// Each migration's `down()` method runs within its own transaction, which is automatically rolled back if it fails.
+    /// Note: In MySQL, DDL statements cause implicit commits and cannot be rolled back automatically.
     /// Returns a [MigrationReport] describing which migrations were rolled back.
     pub fn downgrade(
         &self,
         conn: &mut Conn,
         target_version: u32,
     ) -> Result<MigrationReport<'_>, Error> {
-        // Check if schema version table exists
-        let schema_version_table_existed: bool = conn
-            .query_first(format!(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{}'",
-                self.schema_version_table_name()
-            ))?
-            .map(|(count,): (i64,)| count > 0)
-            .unwrap_or(false);
-
-        if !schema_version_table_existed {
-            // No migrations have been applied yet
-            return Ok(MigrationReport {
-                schema_version_table_existed: false,
-                schema_version_table_created: false,
-                failing_migration: None,
-                migrations_run: vec![],
-            });
-        }
-
-        // Validate checksums of previously-applied migrations (same as upgrade)
-        let has_checksum_column: bool = conn
-            .query_first(format!(
-                "SELECT COUNT(*) FROM information_schema.columns
-                 WHERE table_schema = DATABASE()
-                 AND table_name = '{}'
-                 AND column_name = 'checksum'",
-                self.schema_version_table_name()
-            ))?
-            .map(|(count,): (i64,)| count > 0)
-            .unwrap_or(false);
-
-        if has_checksum_column {
-            let applied_migrations: Vec<(u32, String, String)> = conn.query(format!(
-                "SELECT version, name, checksum FROM {}",
-                self.schema_version_table_name()
-            ))?;
-
-            // Verify checksums and detect missing migrations
-            for (applied_version, applied_name, applied_checksum) in &applied_migrations {
-                if let Some(migration) = self
-                    .migrations()
-                    .iter()
-                    .find(|m| m.version() == *applied_version)
-                {
-                    let current_checksum = GenericMigrator::calculate_checksum(migration);
-                    if current_checksum != *applied_checksum {
-                        return Err(Error::Generic(format!(
-                            "Migration {} checksum mismatch. Expected '{}' but found '{}'. \
-                            Migration name in DB: '{}', current name: '{}'. \
-                            This indicates the migration was modified after being applied.",
-                            applied_version,
-                            applied_checksum,
-                            current_checksum,
-                            applied_name,
-                            migration.name()
-                        )));
-                    }
-                } else {
-                    // Migration exists in database but not in code
-                    return Err(Error::Generic(format!(
-                        "Migration {} ('{}') was previously applied but is no longer present in the migration list. \
-                        Applied migrations cannot be removed from the codebase.",
-                        applied_version,
-                        applied_name
-                    )));
-                }
-            }
-
-            // Detect orphaned migrations (gaps in applied migrations with code present)
-            let applied_versions: Vec<u32> =
-                applied_migrations.iter().map(|(v, _, _)| *v).collect();
-            if !applied_versions.is_empty() {
-                let max_applied = *applied_versions.iter().max().unwrap();
-
-                for expected_version in 1..=max_applied {
-                    if !applied_versions.contains(&expected_version) {
-                        if let Some(missing_migration) = self
-                            .migrations()
-                            .iter()
-                            .find(|m| m.version() == expected_version)
-                        {
-                            return Err(Error::Generic(format!(
-                                "Migration {} ('{}') exists in code but was not applied, yet later migrations are already applied. \
-                                This likely means migration {} was added after migration {} was already applied. \
-                                Applied migrations: {:?}",
-                                expected_version,
-                                missing_migration.name(),
-                                expected_version,
-                                max_applied,
-                                applied_versions
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Get current version
-        let result: Option<(Option<u32>,)> = conn.query_first(format!(
-            "SELECT MAX(version) FROM {}",
-            self.schema_version_table_name()
-        ))?;
-        let current_version: u32 = result.and_then(|(v,)| v).unwrap_or(0);
-
-        // Validate target version
-        if target_version > current_version {
-            return Err(Error::Generic(format!(
-                "Cannot downgrade to version {} when current version is {}. Target must be <= current version.",
-                target_version, current_version
-            )));
-        }
-
-        // Get migrations to rollback (in reverse order)
-        let mut migrations_to_rollback = self
-            .migrations()
-            .iter()
-            .filter(|m| m.version() > target_version && m.version() <= current_version)
-            .map(|x| (x.version(), x))
-            .collect::<Vec<_>>();
-        migrations_to_rollback.sort_by_key(|m| std::cmp::Reverse(m.0)); // Reverse order
-
-        let mut migrations_run: Vec<u32> = Vec::new();
-        let mut failing_migration: Option<MigrationFailure> = None;
-
-        for (migration_version, migration) in migrations_to_rollback {
-            #[cfg(feature = "tracing")]
-            let _span = tracing::info_span!(
-                "mysql_migration_down",
-                version = migration_version,
-                name = %migration.name()
-            )
-            .entered();
-
-            #[cfg(feature = "tracing")]
-            tracing::info!("Rolling back migration");
-
-            // Call on_migration_start hook
-            if let Some(ref callback) = self.migrator.on_migration_start {
-                callback(migration_version, &migration.name());
-            }
-
-            let migration_start = Instant::now();
-
-            // Run the downgrade directly on the connection
-            // Note: In MySQL, DDL statements cause implicit commits and cannot be rolled back
-            let migration_result = migration.mysql_down(conn);
-
-            match migration_result {
-                Ok(_) => {
-                    let migration_duration = migration_start.elapsed();
-
-                    #[cfg(feature = "tracing")]
-                    tracing::info!(
-                        duration_ms = migration_duration.as_millis(),
-                        "Migration rolled back successfully"
-                    );
-
-                    // Delete this migration from the tracking table
-                    conn.exec_drop(
-                        format!(
-                            "DELETE FROM {} WHERE version = ?",
-                            self.schema_version_table_name()
-                        ),
-                        (migration_version,),
-                    )?;
-
-                    // record migration as rolled back
-                    migrations_run.push(migration_version);
-
-                    // Call on_migration_complete hook
-                    if let Some(ref callback) = self.migrator.on_migration_complete {
-                        callback(migration_version, &migration.name(), migration_duration);
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(
-                        error = %e,
-                        "Migration rollback failed"
-                    );
-
-                    // Call on_migration_error hook
-                    if let Some(ref callback) = self.migrator.on_migration_error {
-                        callback(migration_version, &migration.name(), &e);
-                    }
-
-                    failing_migration = Some(MigrationFailure {
-                        migration,
-                        error: e,
-                    });
-                    break;
-                }
-            }
-        }
-
-        Ok(MigrationReport {
-            schema_version_table_existed,
-            schema_version_table_created: false,
-            failing_migration,
-            migrations_run,
-        })
+        self.migrator
+            .generic_downgrade::<MysqlBackend>(conn, target_version)
     }
 }
 
