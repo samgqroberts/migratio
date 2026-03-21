@@ -53,7 +53,7 @@ verify-mysql-versions:
 # Verify compatibility with multiple rusqlite crate versions
 verify-sqlite-versions:
     #!/usr/bin/env bash
-    for v in 0.30.0 0.31.0 0.32.0 0.33.1 0.34.0 0.35.0 0.36.0 0.37.0; do
+    for v in 0.30.0 0.31.0 0.32.0 0.33.1 0.34.0 0.35.0 0.36.0 0.37.0 0.38.0 0.39.0; do
       echo "=== Testing with rusqlite $v ==="
       cargo update -p rusqlite --precise $v
       cargo test --all-features || exit 1

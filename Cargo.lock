@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-migratio"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -1445,7 +1445,7 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
 name = "migratio"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "ctor",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "migratio-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "migratio",
@@ -2087,9 +2087,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.32.1"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+checksum = "1cdbe9230a57259b37f7257d0aff38b8c9dbda3513edba2105e59b130189d82f"
 dependencies = [
  "bitflags",
  "fallible-iterator 0.3.0",
