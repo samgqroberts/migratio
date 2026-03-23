@@ -45,6 +45,7 @@ impl PartialEq for Error {
             #[cfg(feature = "postgres")]
             (Self::Postgres(a), Self::Postgres(b)) => a.to_string() == b.to_string(),
             (Self::Generic(a), Self::Generic(b)) => a == b,
+            #[allow(unreachable_patterns)]
             _ => false,
         }
     }

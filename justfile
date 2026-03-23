@@ -58,3 +58,11 @@ verify-sqlite-versions:
       cargo update -p rusqlite --precise $v
       cargo test --all-features || exit 1
     done
+
+# Check that the library compiles for wasm32 with sqlite feature
+check-wasm32-sqlite:
+    RUSTFLAGS='-D warnings' cargo check --target wasm32-unknown-unknown -p migratio --features sqlite
+
+# Check that the library compiles for wasm32 with no features
+check-wasm32:
+    RUSTFLAGS='-D warnings' cargo check --target wasm32-unknown-unknown -p migratio

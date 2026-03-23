@@ -779,7 +779,7 @@ impl GenericMigrator {
                     callback(migration_version, &migration.name());
                 }
 
-                let migration_start = std::time::Instant::now();
+                let migration_start = web_time::Instant::now();
 
                 // Use Baseline migration type when running the baseline migration on a fresh DB
                 let migration_type =
@@ -1014,7 +1014,7 @@ impl GenericMigrator {
                 callback(migration_version, &migration.name());
             }
 
-            let migration_start = std::time::Instant::now();
+            let migration_start = web_time::Instant::now();
 
             let migration_result = B::execute_migration_down(conn, migration, table_name);
 
